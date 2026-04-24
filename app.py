@@ -117,7 +117,7 @@ app = dash.Dash(
 )
 
 server = app.server
-server.secret_key = os.getenv("SECRET_KEY", "troque-essa-secret-key-em-producao")
+server.secret_key = os.getenv("SECRET_KEY", "4uU4kzaFfM6nmrMMvm2sQV2xhRJwRooH_qa972_0a5OtT6lu0BfXqDzv9QPlQffqp-omynE0zRzqR-fvZEV9Cg")
 
 
 # ============================================================
