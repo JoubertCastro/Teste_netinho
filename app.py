@@ -2,7 +2,6 @@ import os
 from datetime import datetime
 
 import dash
-import dash_auth
 from dash import dcc, html, Input, Output, State, dash_table
 from dash.dcc import send_data_frame
 
@@ -12,7 +11,20 @@ import plotly.express as px
 import folium
 from folium.plugins import MarkerCluster
 
+from flask import request
 from sqlalchemy import create_engine, text
+
+from gerenciador_usuarios import (
+    criar_tabelas_auth,
+    criar_admin_inicial,
+    autenticar_usuario,
+    validar_sessao,
+    encerrar_sessao,
+    listar_usuarios,
+    criar_usuario,
+    resetar_senha,
+    listar_logs_acesso,
+)
 
 
 # ============================================================
@@ -27,19 +39,71 @@ if not DATABASE_URL:
         "Configure essa variável de ambiente no Railway."
     )
 
-DASH_USER = os.getenv("DASH_USER", "MDHC")
-DASH_PASSWORD = os.getenv("DASH_PASSWORD", "1234")
-
-VALID_USERNAME_PASSWORD_PAIRS = {
-    DASH_USER: DASH_PASSWORD
-}
-
 engine = create_engine(
     DATABASE_URL,
     pool_pre_ping=True
 )
 
-ARQ_MAPA_HTML = "mapa.html"
+ARQ_MAPA_HTML = "/tmp/mapa.html"
+
+
+# ============================================================
+# INICIALIZAÇÃO DO BANCO
+# ============================================================
+
+def criar_tabela_pop_rua():
+    """
+    Garante que a tabela principal existe.
+    O coletor também pode criar essa tabela, mas deixamos aqui para o app
+    não quebrar caso o coletor ainda não tenha sido executado.
+    """
+    sql = """
+    CREATE TABLE IF NOT EXISTS pop_rua (
+        id SERIAL PRIMARY KEY,
+        titulo TEXT,
+        url TEXT UNIQUE,
+        municipio TEXT,
+        uf VARCHAR(2),
+        categoria TEXT,
+        latitude DOUBLE PRECISION,
+        longitude DOUBLE PRECISION,
+        data_coleta TIMESTAMP,
+        data_publicacao TIMESTAMP NULL,
+        query_origem TEXT,
+        criado_em TIMESTAMP DEFAULT NOW()
+    );
+
+    CREATE INDEX IF NOT EXISTS ix_pop_rua_municipio
+        ON pop_rua (municipio);
+
+    CREATE INDEX IF NOT EXISTS ix_pop_rua_uf
+        ON pop_rua (uf);
+
+    CREATE INDEX IF NOT EXISTS ix_pop_rua_categoria
+        ON pop_rua (categoria);
+
+    CREATE INDEX IF NOT EXISTS ix_pop_rua_data_coleta
+        ON pop_rua (data_coleta);
+    """
+
+    with engine.begin() as conn:
+        conn.execute(text(sql))
+
+
+def inicializar_banco():
+    """
+    Cria as tabelas de autenticação, admin inicial e tabela pop_rua.
+    """
+    try:
+        criar_tabelas_auth()
+        criar_admin_inicial()
+        criar_tabela_pop_rua()
+        print("✅ Banco inicializado com sucesso.")
+    except Exception as e:
+        print(f"⚠️ Falha ao inicializar banco: {e}")
+
+
+inicializar_banco()
 
 
 # ============================================================
@@ -53,15 +117,44 @@ app = dash.Dash(
 )
 
 server = app.server
-
-auth = dash_auth.BasicAuth(
-    app,
-    VALID_USERNAME_PASSWORD_PAIRS
-)
+server.secret_key = os.getenv("SECRET_KEY", "troque-essa-secret-key-em-producao")
 
 
 # ============================================================
-# BANCO DE DADOS
+# HELPERS DE AUTENTICAÇÃO
+# ============================================================
+
+def obter_ip_requisicao():
+    forwarded_for = request.headers.get("X-Forwarded-For", "")
+    if forwarded_for:
+        return forwarded_for.split(",")[0].strip()
+    return request.remote_addr
+
+
+def obter_user_agent():
+    return request.headers.get("User-Agent", "")
+
+
+def obter_usuario_por_token(token):
+    """
+    Retorna usuário logado ou None.
+    """
+    if not token:
+        return None
+
+    try:
+        return validar_sessao(token)
+    except Exception as e:
+        print(f"Erro ao validar sessão: {e}")
+        return None
+
+
+def usuario_eh_admin(usuario):
+    return bool(usuario and usuario.get("perfil") == "admin")
+
+
+# ============================================================
+# BANCO DE DADOS - POP RUA
 # ============================================================
 
 def carregar_dados_banco():
@@ -275,10 +368,6 @@ def formatar_numero(valor):
         return "0"
 
 
-# ============================================================
-# FILTROS
-# ============================================================
-
 def aplicar_filtros(df, ufs, municipios, categorias, data_ini, data_fim, texto_busca):
     df = df.copy()
 
@@ -299,7 +388,6 @@ def aplicar_filtros(df, ufs, municipios, categorias, data_ini, data_fim, texto_b
     if data_fim:
         data_fim = pd.to_datetime(data_fim, errors="coerce")
         if pd.notna(data_fim):
-            # inclui o dia inteiro
             data_fim = data_fim + pd.Timedelta(days=1)
             df = df[df["data"] < data_fim]
 
@@ -320,10 +408,159 @@ def aplicar_filtros(df, ufs, municipios, categorias, data_ini, data_fim, texto_b
 
 
 # ============================================================
-# LAYOUT
+# LAYOUTS
 # ============================================================
 
-def layout_principal():
+def layout_login():
+    return html.Div(
+        [
+            html.Div(
+                [
+                    html.H1(
+                        "Painel Pop Rua",
+                        style={
+                            "margin": "0",
+                            "fontSize": "30px",
+                            "color": "#111827"
+                        }
+                    ),
+                    html.P(
+                        "Acesse com seu usuário cadastrado no banco de dados.",
+                        style={
+                            "marginTop": "8px",
+                            "color": "#6b7280"
+                        }
+                    ),
+
+                    html.Label("E-mail", style={"fontWeight": "600", "color": "#374151"}),
+                    dcc.Input(
+                        id="login_email",
+                        type="email",
+                        placeholder="seu.email@dominio.com",
+                        autoComplete="username",
+                        style={
+                            "width": "100%",
+                            "height": "42px",
+                            "border": "1px solid #d1d5db",
+                            "borderRadius": "10px",
+                            "padding": "0 12px",
+                            "marginTop": "6px",
+                            "marginBottom": "14px",
+                            "boxSizing": "border-box"
+                        }
+                    ),
+
+                    html.Label("Senha", style={"fontWeight": "600", "color": "#374151"}),
+                    dcc.Input(
+                        id="login_senha",
+                        type="password",
+                        placeholder="Digite sua senha",
+                        autoComplete="current-password",
+                        style={
+                            "width": "100%",
+                            "height": "42px",
+                            "border": "1px solid #d1d5db",
+                            "borderRadius": "10px",
+                            "padding": "0 12px",
+                            "marginTop": "6px",
+                            "marginBottom": "18px",
+                            "boxSizing": "border-box"
+                        }
+                    ),
+
+                    html.Button(
+                        "Entrar",
+                        id="btn_login",
+                        n_clicks=0,
+                        style={
+                            "width": "100%",
+                            "height": "44px",
+                            "backgroundColor": "#1f2937",
+                            "color": "white",
+                            "border": "none",
+                            "borderRadius": "10px",
+                            "fontWeight": "700",
+                            "cursor": "pointer"
+                        }
+                    ),
+
+                    html.Div(
+                        id="login_mensagem",
+                        style={
+                            "marginTop": "14px",
+                            "fontSize": "14px",
+                            "color": "#b91c1c"
+                        }
+                    ),
+
+                    html.Div(
+                        [
+                            html.P(
+                                "Primeiro acesso? Garanta que o admin inicial foi criado via variáveis ADMIN_EMAIL e ADMIN_PASSWORD.",
+                                style={
+                                    "fontSize": "12px",
+                                    "color": "#6b7280",
+                                    "lineHeight": "1.4"
+                                }
+                            )
+                        ],
+                        style={
+                            "marginTop": "18px",
+                            "backgroundColor": "#f9fafb",
+                            "padding": "12px",
+                            "borderRadius": "10px"
+                        }
+                    )
+                ],
+                style={
+                    "width": "380px",
+                    "backgroundColor": "white",
+                    "padding": "30px",
+                    "borderRadius": "18px",
+                    "boxShadow": "0 12px 30px rgba(0,0,0,0.12)"
+                }
+            )
+        ],
+        style={
+            "minHeight": "100vh",
+            "display": "flex",
+            "alignItems": "center",
+            "justifyContent": "center",
+            "background": "linear-gradient(135deg, #f3f4f6, #e5e7eb)",
+            "fontFamily": "Arial, sans-serif"
+        }
+    )
+
+
+def layout_dashboard(usuario):
+    nome_usuario = usuario.get("nome", "Usuário")
+    perfil = usuario.get("perfil", "usuario")
+
+    tabs = [
+        dcc.Tab(
+            label="Dashboard",
+            value="tab_dashboard",
+            children=layout_tab_dashboard()
+        )
+    ]
+
+    if perfil == "admin":
+        tabs.append(
+            dcc.Tab(
+                label="Usuários",
+                value="tab_usuarios",
+                children=layout_tab_usuarios()
+            )
+        )
+
+        tabs.append(
+            dcc.Tab(
+                label="Logs de acesso",
+                value="tab_logs",
+                children=layout_tab_logs()
+            )
+        )
+
     return html.Div(
         [
             dcc.Store(id="dados_base"),
@@ -352,6 +589,74 @@ def layout_principal():
                         ]
                     ),
 
+                    html.Div(
+                        [
+                            html.Div(
+                                [
+                                    html.Strong(nome_usuario),
+                                    html.Br(),
+                                    html.Span(
+                                        f"Perfil: {perfil}",
+                                        style={"fontSize": "12px", "color": "#6b7280"}
+                                    )
+                                ],
+                                style={
+                                    "textAlign": "right",
+                                    "marginRight": "14px"
+                                }
+                            ),
+                            html.Button(
+                                "Sair",
+                                id="btn_logout",
+                                n_clicks=0,
+                                style={
+                                    "backgroundColor": "#b91c1c",
+                                    "color": "white",
+                                    "border": "none",
+                                    "borderRadius": "10px",
+                                    "padding": "11px 16px",
+                                    "cursor": "pointer",
+                                    "fontWeight": "600"
+                                }
+                            )
+                        ],
+                        style={
+                            "display": "flex",
+                            "alignItems": "center"
+                        }
+                    )
+                ],
+                style={
+                    "display": "flex",
+                    "justifyContent": "space-between",
+                    "alignItems": "center",
+                    "marginBottom": "22px"
+                }
+            ),
+
+            dcc.Tabs(
+                id="tabs_principais",
+                value="tab_dashboard",
+                children=tabs,
+                style={
+                    "marginBottom": "20px"
+                }
+            )
+        ],
+        style={
+            "padding": "26px",
+            "backgroundColor": "#f3f4f6",
+            "minHeight": "100vh",
+            "fontFamily": "Arial, sans-serif"
+        }
+    )
+
+
+def layout_tab_dashboard():
+    return html.Div(
+        [
+            html.Div(
+                [
                     html.Button(
                         "🔄 Recarregar dados",
                         id="btn_recarregar",
@@ -367,12 +672,7 @@ def layout_principal():
                         }
                     )
                 ],
-                style={
-                    "display": "flex",
-                    "justifyContent": "space-between",
-                    "alignItems": "center",
-                    "marginBottom": "22px"
-                }
+                style={"marginBottom": "14px"}
             ),
 
             html.Div(
@@ -590,16 +890,284 @@ def layout_principal():
 
             dcc.Download(id="download_csv")
         ],
+        style={"paddingTop": "18px"}
+    )
+
+
+def layout_tab_usuarios():
+    return html.Div(
+        [
+            html.Div(
+                [
+                    html.H3("Gerenciamento de usuários", style={"marginTop": 0}),
+                    html.Button(
+                        "🔄 Recarregar usuários",
+                        id="btn_recarregar_usuarios",
+                        n_clicks=0,
+                        style={
+                            "backgroundColor": "#1f2937",
+                            "color": "white",
+                            "border": "none",
+                            "borderRadius": "10px",
+                            "padding": "10px 16px",
+                            "cursor": "pointer",
+                            "fontWeight": "600"
+                        }
+                    )
+                ],
+                style={
+                    "display": "flex",
+                    "justifyContent": "space-between",
+                    "alignItems": "center",
+                    "marginBottom": "16px"
+                }
+            ),
+
+            html.Div(
+                [
+                    dcc.Input(id="novo_nome", type="text", placeholder="Nome", style={"height": "38px", "padding": "0 10px"}),
+                    dcc.Input(id="novo_email", type="email", placeholder="E-mail", style={"height": "38px", "padding": "0 10px"}),
+                    dcc.Input(id="novo_senha", type="password", placeholder="Senha inicial", style={"height": "38px", "padding": "0 10px"}),
+                    dcc.Dropdown(
+                        id="novo_perfil",
+                        options=[
+                            {"label": "Admin", "value": "admin"},
+                            {"label": "Gestor", "value": "gestor"},
+                            {"label": "Usuário", "value": "usuario"},
+                            {"label": "Visualizador", "value": "visualizador"},
+                        ],
+                        value="usuario",
+                        clearable=False
+                    ),
+                    html.Button(
+                        "Criar usuário",
+                        id="btn_criar_usuario",
+                        n_clicks=0,
+                        style={
+                            "backgroundColor": "#2563eb",
+                            "color": "white",
+                            "border": "none",
+                            "borderRadius": "10px",
+                            "padding": "10px 16px",
+                            "cursor": "pointer",
+                            "fontWeight": "600"
+                        }
+                    ),
+                ],
+                style={
+                    "display": "grid",
+                    "gridTemplateColumns": "1.2fr 1.4fr 1fr 1fr auto",
+                    "gap": "10px",
+                    "marginBottom": "10px"
+                }
+            ),
+
+            html.Div(
+                id="usuarios_status",
+                style={"marginBottom": "14px", "fontSize": "14px"}
+            ),
+
+            dash_table.DataTable(
+                id="tabela_usuarios",
+                columns=[
+                    {"name": "ID", "id": "id"},
+                    {"name": "Nome", "id": "nome"},
+                    {"name": "E-mail", "id": "email"},
+                    {"name": "Perfil", "id": "perfil"},
+                    {"name": "Ativo", "id": "ativo"},
+                    {"name": "Primeiro acesso", "id": "primeiro_acesso"},
+                    {"name": "Senha expirada", "id": "senha_expirada"},
+                    {"name": "Último login", "id": "ultimo_login"},
+                ],
+                page_size=12,
+                sort_action="native",
+                filter_action="native",
+                style_table={"overflowX": "auto"},
+                style_cell={
+                    "textAlign": "left",
+                    "padding": "8px",
+                    "fontFamily": "Arial",
+                    "fontSize": "13px"
+                },
+                style_header={
+                    "fontWeight": "bold",
+                    "backgroundColor": "#f3f4f6"
+                }
+            )
+        ],
         style={
-            "padding": "26px",
-            "backgroundColor": "#f3f4f6",
-            "minHeight": "100vh",
-            "fontFamily": "Arial, sans-serif"
+            "backgroundColor": "white",
+            "padding": "18px",
+            "borderRadius": "16px",
+            "boxShadow": "0 4px 14px rgba(0,0,0,0.08)",
+            "marginTop": "18px"
         }
     )
 
 
-app.layout = layout_principal
+def layout_tab_logs():
+    return html.Div(
+        [
+            html.Div(
+                [
+                    html.H3("Logs de acesso", style={"marginTop": 0}),
+                    html.Button(
+                        "🔄 Recarregar logs",
+                        id="btn_recarregar_logs",
+                        n_clicks=0,
+                        style={
+                            "backgroundColor": "#1f2937",
+                            "color": "white",
+                            "border": "none",
+                            "borderRadius": "10px",
+                            "padding": "10px 16px",
+                            "cursor": "pointer",
+                            "fontWeight": "600"
+                        }
+                    )
+                ],
+                style={
+                    "display": "flex",
+                    "justifyContent": "space-between",
+                    "alignItems": "center",
+                    "marginBottom": "16px"
+                }
+            ),
+
+            dash_table.DataTable(
+                id="tabela_logs",
+                columns=[
+                    {"name": "ID", "id": "id"},
+                    {"name": "Usuário ID", "id": "usuario_id"},
+                    {"name": "E-mail", "id": "email"},
+                    {"name": "Sucesso", "id": "sucesso"},
+                    {"name": "Motivo", "id": "motivo"},
+                    {"name": "IP", "id": "ip"},
+                    {"name": "User Agent", "id": "user_agent"},
+                    {"name": "Criado em", "id": "criado_em"},
+                ],
+                page_size=15,
+                sort_action="native",
+                filter_action="native",
+                style_table={"overflowX": "auto"},
+                style_cell={
+                    "textAlign": "left",
+                    "padding": "8px",
+                    "fontFamily": "Arial",
+                    "fontSize": "13px",
+                    "whiteSpace": "normal",
+                    "height": "auto",
+                    "maxWidth": "380px"
+                },
+                style_header={
+                    "fontWeight": "bold",
+                    "backgroundColor": "#f3f4f6"
+                }
+            )
+        ],
+        style={
+            "backgroundColor": "white",
+            "padding": "18px",
+            "borderRadius": "16px",
+            "boxShadow": "0 4px 14px rgba(0,0,0,0.08)",
+            "marginTop": "18px"
+        }
+    )
+
+
+app.layout = html.Div(
+    [
+        dcc.Location(id="url"),
+        dcc.Store(id="sessao_token", storage_type="session"),
+        dcc.Store(id="usuario_logado", storage_type="session"),
+        html.Div(id="pagina_container")
+    ]
+)
+
+
+# ============================================================
+# CALLBACKS - AUTENTICAÇÃO
+# ============================================================
+
+@app.callback(
+    Output("pagina_container", "children"),
+    Input("sessao_token", "data")
+)
+def renderizar_pagina(token):
+    usuario = obter_usuario_por_token(token)
+
+    if not usuario:
+        return layout_login()
+
+    return layout_dashboard(usuario)
+
+
+@app.callback(
+    [
+        Output("sessao_token", "data"),
+        Output("usuario_logado", "data"),
+        Output("login_mensagem", "children"),
+        Output("login_mensagem", "style")
+    ],
+    Input("btn_login", "n_clicks"),
+    [
+        State("login_email", "value"),
+        State("login_senha", "value")
+    ],
+    prevent_initial_call=True
+)
+def fazer_login(n_clicks, email, senha):
+    if not n_clicks:
+        return dash.no_update, dash.no_update, dash.no_update, dash.no_update
+
+    if not email or not senha:
+        return (
+            dash.no_update,
+            dash.no_update,
+            "Informe e-mail e senha.",
+            {"marginTop": "14px", "fontSize": "14px", "color": "#b91c1c"}
+        )
+
+    resultado = autenticar_usuario(
+        email=email,
+        senha=senha,
+        ip=obter_ip_requisicao(),
+        user_agent=obter_user_agent()
+    )
+
+    if not resultado.get("ok"):
+        return (
+            dash.no_update,
+            dash.no_update,
+            resultado.get("motivo", "Falha ao autenticar."),
+            {"marginTop": "14px", "fontSize": "14px", "color": "#b91c1c"}
+        )
+
+    return (
+        resultado["token_sessao"],
+        resultado["usuario"],
+        "Login realizado com sucesso.",
+        {"marginTop": "14px", "fontSize": "14px", "color": "#047857"}
+    )
+
+
+@app.callback(
+    [
+        Output("sessao_token", "data", allow_duplicate=True),
+        Output("usuario_logado", "data", allow_duplicate=True)
+    ],
+    Input("btn_logout", "n_clicks"),
+    State("sessao_token", "data"),
+    prevent_initial_call=True
+)
+def fazer_logout(n_clicks, token):
+    if n_clicks and token:
+        try:
+            encerrar_sessao(token)
+        except Exception as e:
+            print(f"Erro ao encerrar sessão: {e}")
+
+    return None, None
 
 
 # ============================================================
@@ -614,9 +1182,22 @@ app.layout = layout_principal
         Output("filtro_municipio", "options"),
         Output("filtro_categoria", "options")
     ],
-    Input("btn_recarregar", "n_clicks")
+    Input("btn_recarregar", "n_clicks"),
+    State("sessao_token", "data")
 )
-def carregar_dados(n_clicks):
+def carregar_dados(n_clicks, token):
+    usuario = obter_usuario_por_token(token)
+
+    if not usuario:
+        df_vazio = pd.DataFrame()
+        return (
+            df_vazio.to_json(date_format="iso", orient="split"),
+            "Sessão inválida ou expirada.",
+            [],
+            [],
+            []
+        )
+
     df = carregar_dados_banco()
 
     total = len(df)
@@ -674,7 +1255,8 @@ def carregar_dados(n_clicks):
         Input("filtro_data", "start_date"),
         Input("filtro_data", "end_date"),
         Input("filtro_texto", "value")
-    ]
+    ],
+    State("sessao_token", "data")
 )
 def atualizar_dashboard(
     dados_base,
@@ -683,8 +1265,24 @@ def atualizar_dashboard(
     categorias,
     data_ini,
     data_fim,
-    texto_busca
+    texto_busca,
+    token
 ):
+    usuario = obter_usuario_por_token(token)
+
+    if not usuario:
+        df_vazio = pd.DataFrame(columns=["data", "municipio", "uf", "categoria", "titulo", "url", "query_origem"])
+        return (
+            "",
+            criar_figura_vazia("Registros por categoria"),
+            criar_figura_vazia("Registros por UF"),
+            criar_figura_vazia("Evolução no tempo"),
+            df_vazio.to_dict("records"),
+            [],
+            "Sessão inválida ou expirada.",
+            df_vazio.to_json(date_format="iso", orient="split")
+        )
+
     if not dados_base:
         df = carregar_dados_banco()
     else:
@@ -913,9 +1511,15 @@ def atualizar_dashboard(
     Output("download_csv", "data"),
     Input("btn_exportar", "n_clicks"),
     State("dados_filtrados", "data"),
+    State("sessao_token", "data"),
     prevent_initial_call=True
 )
-def exportar_csv(n_clicks, dados_filtrados):
+def exportar_csv(n_clicks, dados_filtrados, token):
+    usuario = obter_usuario_por_token(token)
+
+    if not usuario:
+        return dash.no_update
+
     if not n_clicks:
         return dash.no_update
 
@@ -953,6 +1557,105 @@ def exportar_csv(n_clicks, dados_filtrados):
         sep=";",
         encoding="utf-8-sig"
     )
+
+
+# ============================================================
+# CALLBACKS - ADMIN / USUÁRIOS
+# ============================================================
+
+@app.callback(
+    [
+        Output("tabela_usuarios", "data"),
+        Output("usuarios_status", "children")
+    ],
+    Input("btn_recarregar_usuarios", "n_clicks"),
+    State("sessao_token", "data")
+)
+def carregar_usuarios_admin(n_clicks, token):
+    usuario = obter_usuario_por_token(token)
+
+    if not usuario_eh_admin(usuario):
+        return [], "Acesso negado."
+
+    try:
+        usuarios = listar_usuarios()
+        df = pd.DataFrame(usuarios)
+
+        if df.empty:
+            return [], "Nenhum usuário encontrado."
+
+        for col in ["criado_em", "atualizado_em", "ultimo_login"]:
+            if col in df.columns:
+                df[col] = pd.to_datetime(df[col], errors="coerce").dt.strftime("%d/%m/%Y %H:%M")
+
+        return df.to_dict("records"), f"Usuários carregados: {len(df)}"
+
+    except Exception as e:
+        return [], f"Erro ao carregar usuários: {e}"
+
+
+@app.callback(
+    Output("usuarios_status", "children", allow_duplicate=True),
+    Input("btn_criar_usuario", "n_clicks"),
+    [
+        State("novo_nome", "value"),
+        State("novo_email", "value"),
+        State("novo_senha", "value"),
+        State("novo_perfil", "value"),
+        State("sessao_token", "data")
+    ],
+    prevent_initial_call=True
+)
+def criar_usuario_admin(n_clicks, nome, email, senha, perfil, token):
+    usuario = obter_usuario_por_token(token)
+
+    if not usuario_eh_admin(usuario):
+        return "Acesso negado."
+
+    if not n_clicks:
+        return dash.no_update
+
+    try:
+        usuario_id = criar_usuario(
+            nome=nome,
+            email=email,
+            senha=senha,
+            perfil=perfil or "usuario",
+            primeiro_acesso=True
+        )
+
+        return f"✅ Usuário criado com sucesso. ID: {usuario_id}. Clique em Recarregar usuários."
+
+    except Exception as e:
+        return f"❌ Erro ao criar usuário: {e}"
+
+
+@app.callback(
+    Output("tabela_logs", "data"),
+    Input("btn_recarregar_logs", "n_clicks"),
+    State("sessao_token", "data")
+)
+def carregar_logs_admin(n_clicks, token):
+    usuario = obter_usuario_por_token(token)
+
+    if not usuario_eh_admin(usuario):
+        return []
+
+    try:
+        logs = listar_logs_acesso(limit=300)
+        df = pd.DataFrame(logs)
+
+        if df.empty:
+            return []
+
+        if "criado_em" in df.columns:
+            df["criado_em"] = pd.to_datetime(df["criado_em"], errors="coerce").dt.strftime("%d/%m/%Y %H:%M:%S")
+
+        return df.to_dict("records")
+
+    except Exception as e:
+        print(f"Erro ao carregar logs: {e}")
+        return []
 
 
 # ============================================================
