@@ -148,6 +148,27 @@ def usuario_eh_admin(usuario):
     return bool(usuario and usuario.get("perfil") == "admin")
 
 
+def resolver_token(token=None, token_contexto=None, usuario_store=None):
+    """
+    Resolve o token de sessão a partir de múltiplas fontes.
+
+    Motivo:
+    Em alguns fluxos do Dash, principalmente ao alternar abas renderizadas dinamicamente,
+    o State do dcc.Store global pode chegar vazio em callbacks específicos.
+    Por isso mantemos também um token_contexto dentro do layout autenticado.
+    """
+    if token:
+        return token
+
+    if token_contexto:
+        return token_contexto
+
+    if isinstance(usuario_store, dict):
+        return usuario_store.get("token_sessao")
+
+    return None
+
+
 def formatar_numero(valor):
     try:
         return f"{int(valor):,}".replace(",", ".")
@@ -479,6 +500,11 @@ def layout_dashboard(usuario):
         [
             dcc.Store(id="dados_base"),
             dcc.Store(id="dados_filtrados"),
+            dcc.Store(
+                id="token_contexto",
+                data=usuario.get("token_sessao"),
+                storage_type="memory"
+            ),
 
             html.Div(
                 [
@@ -946,9 +972,12 @@ def fazer_login(n_clicks, email, senha):
             {"marginTop": "14px", "fontSize": "14px", "color": "#b91c1c"}
         )
 
+    usuario_store = dict(resultado["usuario"])
+    usuario_store["token_sessao"] = resultado["token_sessao"]
+
     return (
         resultado["token_sessao"],
-        resultado["usuario"],
+        usuario_store,
         "Login realizado com sucesso.",
         {"marginTop": "14px", "fontSize": "14px", "color": "#047857"}
     )
@@ -986,10 +1015,16 @@ def fazer_logout(n_clicks, token):
         Output("filtro_categoria", "options")
     ],
     Input("btn_recarregar", "n_clicks"),
-    State("sessao_token", "data")
+    [
+        State("sessao_token", "data"),
+        State("token_contexto", "data"),
+        State("usuario_logado", "data")
+    ]
 )
-def carregar_dados(n_clicks, token):
+def carregar_dados(n_clicks, token, token_contexto, usuario_store):
     try:
+        token = resolver_token(token, token_contexto, usuario_store)
+
         # Evita disparos automáticos enquanto o token ainda não foi carregado pelo navegador.
         if not token:
             raise PreventUpdate
@@ -1071,7 +1106,11 @@ def carregar_dados(n_clicks, token):
         Input("filtro_data", "end_date"),
         Input("filtro_texto", "value")
     ],
-    State("sessao_token", "data")
+    [
+        State("sessao_token", "data"),
+        State("token_contexto", "data"),
+        State("usuario_logado", "data")
+    ]
 )
 def atualizar_dashboard(
     dados_base,
@@ -1081,9 +1120,13 @@ def atualizar_dashboard(
     data_ini,
     data_fim,
     texto_busca,
-    token
+    token,
+    token_contexto,
+    usuario_store
 ):
     try:
+        token = resolver_token(token, token_contexto, usuario_store)
+
         # Ao alternar entre abas, alguns callbacks podem disparar antes do token estar disponível.
         # Nesses casos, não atualizamos nada para evitar a mensagem indevida de sessão inválida.
         if not token:
@@ -1291,10 +1334,14 @@ def atualizar_dashboard(
     Input("btn_exportar", "n_clicks"),
     State("dados_filtrados", "data"),
     State("sessao_token", "data"),
+    State("token_contexto", "data"),
+    State("usuario_logado", "data"),
     prevent_initial_call=True
 )
-def exportar_csv(n_clicks, dados_filtrados, token):
+def exportar_csv(n_clicks, dados_filtrados, token, token_contexto, usuario_store):
     try:
+        token = resolver_token(token, token_contexto, usuario_store)
+
         if not token:
             raise PreventUpdate
 
@@ -1345,53 +1392,6 @@ def exportar_csv(n_clicks, dados_filtrados, token):
         return dash.no_update
 
 
-
-def formatar_usuarios_para_tabela():
-    """
-    Busca e formata usuários para exibir na DataTable.
-    Usado tanto no botão Recarregar usuários quanto após criar novo usuário.
-    """
-    usuarios = listar_usuarios()
-    df = pd.DataFrame(usuarios)
-
-    if df.empty:
-        return []
-
-    for col in ["criado_em", "atualizado_em", "ultimo_login"]:
-        if col in df.columns:
-            df[col] = pd.to_datetime(df[col], errors="coerce").dt.strftime("%d/%m/%Y %H:%M")
-
-    return df.to_dict("records")
-
-
-def validar_campos_novo_usuario(nome, email, senha, perfil):
-    """
-    Valida campos antes de chamar o banco.
-    Evita erro genérico e melhora retorno na tela.
-    """
-    nome = str(nome or "").strip()
-    email = str(email or "").strip().lower()
-    senha = str(senha or "")
-    perfil = str(perfil or "usuario").strip().lower()
-
-    if not nome:
-        return False, "Informe o nome do usuário.", nome, email, senha, perfil
-
-    if not email:
-        return False, "Informe o e-mail do usuário.", nome, email, senha, perfil
-
-    if "@" not in email or "." not in email:
-        return False, "Informe um e-mail válido.", nome, email, senha, perfil
-
-    if not senha or len(senha) < 6:
-        return False, "A senha inicial deve ter pelo menos 6 caracteres.", nome, email, senha, perfil
-
-    if perfil not in {"admin", "gestor", "usuario", "visualizador"}:
-        return False, "Perfil inválido.", nome, email, senha, perfil
-
-    return True, "", nome, email, senha, perfil
-
-
 # ============================================================
 # CALLBACKS - ADMIN
 # ============================================================
@@ -1402,9 +1402,13 @@ def validar_campos_novo_usuario(nome, email, senha, perfil):
         Output("usuarios_status", "children")
     ],
     Input("btn_recarregar_usuarios", "n_clicks"),
-    State("sessao_token", "data")
+    State("sessao_token", "data"),
+    State("token_contexto", "data"),
+    State("usuario_logado", "data")
 )
-def carregar_usuarios_admin(n_clicks, token):
+def carregar_usuarios_admin(n_clicks, token, token_contexto, usuario_store):
+    token = resolver_token(token, token_contexto, usuario_store)
+
     if not token:
         raise PreventUpdate
 
@@ -1414,12 +1418,17 @@ def carregar_usuarios_admin(n_clicks, token):
         return [], "Acesso negado."
 
     try:
-        dados = formatar_usuarios_para_tabela()
+        usuarios = listar_usuarios()
+        df = pd.DataFrame(usuarios)
 
-        if not dados:
+        if df.empty:
             return [], "Nenhum usuário encontrado."
 
-        return dados, f"Usuários carregados: {len(dados)}"
+        for col in ["criado_em", "atualizado_em", "ultimo_login"]:
+            if col in df.columns:
+                df[col] = pd.to_datetime(df[col], errors="coerce").dt.strftime("%d/%m/%Y %H:%M")
+
+        return df.to_dict("records"), f"Usuários carregados: {len(df)}"
 
     except PreventUpdate:
         raise
@@ -1429,110 +1438,59 @@ def carregar_usuarios_admin(n_clicks, token):
 
 
 @app.callback(
-    [
-        Output("usuarios_status", "children", allow_duplicate=True),
-        Output("tabela_usuarios", "data", allow_duplicate=True),
-        Output("novo_nome", "value"),
-        Output("novo_email", "value"),
-        Output("novo_senha", "value"),
-    ],
+    Output("usuarios_status", "children", allow_duplicate=True),
     Input("btn_criar_usuario", "n_clicks"),
     [
         State("novo_nome", "value"),
         State("novo_email", "value"),
         State("novo_senha", "value"),
         State("novo_perfil", "value"),
-        State("sessao_token", "data")
+        State("sessao_token", "data"),
+        State("token_contexto", "data"),
+        State("usuario_logado", "data")
     ],
     prevent_initial_call=True
 )
-def criar_usuario_admin(n_clicks, nome, email, senha, perfil, token):
-    """
-    Cria usuário pelo painel admin.
-
-    Ajustes importantes:
-    - não usa PreventUpdate quando o admin clicou no botão, para não parecer erro silencioso;
-    - valida os campos antes do banco;
-    - atualiza a tabela automaticamente após criar;
-    - limpa nome/e-mail/senha quando cria com sucesso.
-    """
-    if not n_clicks:
-        raise PreventUpdate
-
+def criar_usuario_admin(n_clicks, nome, email, senha, perfil, token, token_contexto, usuario_store):
     if not token:
-        return (
-            "Sessão não encontrada. Faça login novamente.",
-            dash.no_update,
-            dash.no_update,
-            dash.no_update,
-            dash.no_update,
-        )
+        raise PreventUpdate
 
     usuario = obter_usuario_por_token(token)
 
     if not usuario_eh_admin(usuario):
-        return (
-            "Acesso negado. Apenas administradores podem criar usuários.",
-            dash.no_update,
-            dash.no_update,
-            dash.no_update,
-            dash.no_update,
-        )
+        return "Acesso negado."
 
-    ok, msg, nome, email, senha, perfil = validar_campos_novo_usuario(
-        nome=nome,
-        email=email,
-        senha=senha,
-        perfil=perfil
-    )
-
-    if not ok:
-        return (
-            f"❌ {msg}",
-            dash.no_update,
-            dash.no_update,
-            dash.no_update,
-            dash.no_update,
-        )
+    if not n_clicks:
+        return dash.no_update
 
     try:
         usuario_id = criar_usuario(
             nome=nome,
             email=email,
             senha=senha,
-            perfil=perfil,
+            perfil=perfil or "usuario",
             primeiro_acesso=True
         )
 
-        dados_atualizados = formatar_usuarios_para_tabela()
-
-        return (
-            f"✅ Usuário criado com sucesso. ID: {usuario_id}.",
-            dados_atualizados,
-            "",
-            "",
-            "",
-        )
+        return f"✅ Usuário criado com sucesso. ID: {usuario_id}. Clique em Recarregar usuários."
 
     except PreventUpdate:
         raise
     except Exception as e:
         log_erro("criar_usuario_admin", e)
-        return (
-            f"❌ Erro ao criar usuário: {e}",
-            dash.no_update,
-            dash.no_update,
-            dash.no_update,
-            dash.no_update,
-        )
+        return f"❌ Erro ao criar usuário: {e}"
 
 
 @app.callback(
     Output("tabela_logs", "data"),
     Input("btn_recarregar_logs", "n_clicks"),
-    State("sessao_token", "data")
+    State("sessao_token", "data"),
+    State("token_contexto", "data"),
+    State("usuario_logado", "data")
 )
-def carregar_logs_admin(n_clicks, token):
+def carregar_logs_admin(n_clicks, token, token_contexto, usuario_store):
+    token = resolver_token(token, token_contexto, usuario_store)
+
     if not token:
         raise PreventUpdate
 
