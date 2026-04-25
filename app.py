@@ -1,5 +1,7 @@
 import os
+import traceback
 from datetime import datetime
+from io import StringIO
 
 import dash
 from dash import dcc, html, Input, Output, State, dash_table
@@ -22,7 +24,6 @@ from gerenciador_usuarios import (
     encerrar_sessao,
     listar_usuarios,
     criar_usuario,
-    resetar_senha,
     listar_logs_acesso,
 )
 
@@ -35,16 +36,13 @@ DATABASE_URL = os.getenv("DATABASE_URL")
 
 if not DATABASE_URL:
     raise RuntimeError(
-        "DATABASE_URL não encontrada. "
-        "Configure essa variável de ambiente no Railway."
+        "DATABASE_URL não encontrada. Configure essa variável no Railway."
     )
 
-engine = create_engine(
-    DATABASE_URL,
-    pool_pre_ping=True
-)
+engine = create_engine(DATABASE_URL, pool_pre_ping=True)
 
 ARQ_MAPA_HTML = "/tmp/mapa.html"
+APP_TIMEZONE = os.getenv("APP_TIMEZONE", "America/Sao_Paulo")
 
 
 # ============================================================
@@ -52,11 +50,6 @@ ARQ_MAPA_HTML = "/tmp/mapa.html"
 # ============================================================
 
 def criar_tabela_pop_rua():
-    """
-    Garante que a tabela principal existe.
-    O coletor também pode criar essa tabela, mas deixamos aqui para o app
-    não quebrar caso o coletor ainda não tenha sido executado.
-    """
     sql = """
     CREATE TABLE IF NOT EXISTS pop_rua (
         id SERIAL PRIMARY KEY,
@@ -73,17 +66,10 @@ def criar_tabela_pop_rua():
         criado_em TIMESTAMP DEFAULT NOW()
     );
 
-    CREATE INDEX IF NOT EXISTS ix_pop_rua_municipio
-        ON pop_rua (municipio);
-
-    CREATE INDEX IF NOT EXISTS ix_pop_rua_uf
-        ON pop_rua (uf);
-
-    CREATE INDEX IF NOT EXISTS ix_pop_rua_categoria
-        ON pop_rua (categoria);
-
-    CREATE INDEX IF NOT EXISTS ix_pop_rua_data_coleta
-        ON pop_rua (data_coleta);
+    CREATE INDEX IF NOT EXISTS ix_pop_rua_municipio ON pop_rua (municipio);
+    CREATE INDEX IF NOT EXISTS ix_pop_rua_uf ON pop_rua (uf);
+    CREATE INDEX IF NOT EXISTS ix_pop_rua_categoria ON pop_rua (categoria);
+    CREATE INDEX IF NOT EXISTS ix_pop_rua_data_coleta ON pop_rua (data_coleta);
     """
 
     with engine.begin() as conn:
@@ -91,16 +77,14 @@ def criar_tabela_pop_rua():
 
 
 def inicializar_banco():
-    """
-    Cria as tabelas de autenticação, admin inicial e tabela pop_rua.
-    """
     try:
         criar_tabelas_auth()
         criar_admin_inicial()
         criar_tabela_pop_rua()
-        print("✅ Banco inicializado com sucesso.")
+        print("✅ Banco inicializado com sucesso.", flush=True)
     except Exception as e:
-        print(f"⚠️ Falha ao inicializar banco: {e}")
+        print(f"⚠️ Falha ao inicializar banco: {e}", flush=True)
+        traceback.print_exc()
 
 
 inicializar_banco()
@@ -117,12 +101,25 @@ app = dash.Dash(
 )
 
 server = app.server
-server.secret_key = os.getenv("SECRET_KEY", "4uU4kzaFfM6nmrMMvm2sQV2xhRJwRooH_qa972_0a5OtT6lu0BfXqDzv9QPlQffqp-omynE0zRzqR-fvZEV9Cg")
+server.secret_key = os.getenv("SECRET_KEY", "dev-secret-key-change-me")
 
 
 # ============================================================
-# HELPERS DE AUTENTICAÇÃO
+# HELPERS
 # ============================================================
+
+def log_erro(contexto, erro):
+    print(f"❌ ERRO EM {contexto}: {erro}", flush=True)
+    traceback.print_exc()
+
+
+def mensagem_erro_usuario(contexto, erro):
+    return (
+        f"Ocorreu um erro ao processar {contexto}. "
+        f"Verifique os logs do Railway para o detalhe técnico. "
+        f"Resumo: {type(erro).__name__}: {erro}"
+    )
+
 
 def obter_ip_requisicao():
     forwarded_for = request.headers.get("X-Forwarded-For", "")
@@ -136,16 +133,13 @@ def obter_user_agent():
 
 
 def obter_usuario_por_token(token):
-    """
-    Retorna usuário logado ou None.
-    """
     if not token:
         return None
 
     try:
         return validar_sessao(token)
     except Exception as e:
-        print(f"Erro ao validar sessão: {e}")
+        log_erro("validar_sessao", e)
         return None
 
 
@@ -153,14 +147,40 @@ def usuario_eh_admin(usuario):
     return bool(usuario and usuario.get("perfil") == "admin")
 
 
+def formatar_numero(valor):
+    try:
+        return f"{int(valor):,}".replace(",", ".")
+    except Exception:
+        return "0"
+
+
+def converter_datetime_serie(serie):
+    """
+    Converte datas com ou sem timezone para datetime sem timezone em America/Sao_Paulo.
+    Isso evita erros de mixed timezone no Pandas/Plotly/Dash.
+    """
+    dt = pd.to_datetime(serie, errors="coerce", utc=True)
+
+    try:
+        dt = dt.dt.tz_convert(APP_TIMEZONE).dt.tz_localize(None)
+    except Exception:
+        dt = dt.dt.tz_localize(None)
+
+    return dt
+
+
+def ler_json_dataframe(dados_json):
+    if not dados_json:
+        return pd.DataFrame()
+
+    return pd.read_json(StringIO(dados_json), orient="split")
+
+
 # ============================================================
 # BANCO DE DADOS - POP RUA
 # ============================================================
 
 def carregar_dados_banco():
-    """
-    Lê os dados da tabela pop_rua no PostgreSQL.
-    """
     sql = """
     SELECT
         id,
@@ -182,31 +202,13 @@ def carregar_dados_banco():
     try:
         df = pd.read_sql(sql, engine)
     except Exception as e:
-        print(f"Erro ao carregar dados do banco: {e}")
-        df = pd.DataFrame(
-            columns=[
-                "id",
-                "titulo",
-                "url",
-                "municipio",
-                "uf",
-                "categoria",
-                "latitude",
-                "longitude",
-                "data_coleta",
-                "data_publicacao",
-                "query_origem",
-                "criado_em"
-            ]
-        )
+        log_erro("carregar_dados_banco", e)
+        df = pd.DataFrame()
 
     return tratar_dataframe(df)
 
 
 def tratar_dataframe(df):
-    """
-    Padroniza o dataframe vindo do banco.
-    """
     df = df.copy()
 
     colunas_necessarias = [
@@ -228,37 +230,31 @@ def tratar_dataframe(df):
         if coluna not in df.columns:
             df[coluna] = None
 
-    df["municipio"] = df["municipio"].fillna("Não identificado")
-    df["uf"] = df["uf"].fillna("NI")
-    df["categoria"] = df["categoria"].fillna("Outros")
-    df["titulo"] = df["titulo"].fillna("")
-    df["url"] = df["url"].fillna("")
-    df["query_origem"] = df["query_origem"].fillna("")
+    for coluna in ["municipio", "uf", "categoria", "titulo", "url", "query_origem"]:
+        df[coluna] = df[coluna].fillna("").astype(str).str.strip()
+
+    df["municipio"] = df["municipio"].replace("", "Não identificado")
+    df["uf"] = df["uf"].replace("", "NI")
+    df["categoria"] = df["categoria"].replace("", "Outros")
 
     df["latitude"] = pd.to_numeric(df["latitude"], errors="coerce")
     df["longitude"] = pd.to_numeric(df["longitude"], errors="coerce")
 
-    df["data_coleta"] = pd.to_datetime(df["data_coleta"], errors="coerce")
-    df["data_publicacao"] = pd.to_datetime(df["data_publicacao"], errors="coerce")
-    df["criado_em"] = pd.to_datetime(df["criado_em"], errors="coerce")
+    df["data_coleta"] = converter_datetime_serie(df["data_coleta"])
+    df["data_publicacao"] = converter_datetime_serie(df["data_publicacao"])
+    df["criado_em"] = converter_datetime_serie(df["criado_em"])
 
-    # Campo principal usado nos filtros e gráficos.
-    # Se tiver data_publicacao, usa ela; senão usa data_coleta.
     df["data"] = df["data_publicacao"].fillna(df["data_coleta"])
-
     df["quantidade"] = 1
 
     return df
 
 
 # ============================================================
-# MAPA
+# MAPA E GRÁFICOS
 # ============================================================
 
 def gerar_mapa(df):
-    """
-    Gera mapa Folium e retorna HTML.
-    """
     mapa = folium.Map(
         location=[-14.2350, -51.9253],
         zoom_start=4,
@@ -300,10 +296,6 @@ def gerar_mapa(df):
         return f.read()
 
 
-# ============================================================
-# HELPERS VISUAIS
-# ============================================================
-
 def criar_figura_vazia(titulo):
     fig = px.scatter(title=titulo)
     fig.update_layout(
@@ -325,30 +317,9 @@ def criar_figura_vazia(titulo):
 def card_resumo(titulo, valor, subtitulo=None):
     return html.Div(
         [
-            html.Div(
-                titulo,
-                style={
-                    "fontSize": "13px",
-                    "color": "#666",
-                    "marginBottom": "6px"
-                }
-            ),
-            html.Div(
-                valor,
-                style={
-                    "fontSize": "26px",
-                    "fontWeight": "700",
-                    "color": "#222"
-                }
-            ),
-            html.Div(
-                subtitulo or "",
-                style={
-                    "fontSize": "12px",
-                    "color": "#777",
-                    "marginTop": "4px"
-                }
-            )
+            html.Div(titulo, style={"fontSize": "13px", "color": "#666", "marginBottom": "6px"}),
+            html.Div(valor, style={"fontSize": "26px", "fontWeight": "700", "color": "#222"}),
+            html.Div(subtitulo or "", style={"fontSize": "12px", "color": "#777", "marginTop": "4px"})
         ],
         style={
             "backgroundColor": "#ffffff",
@@ -359,13 +330,6 @@ def card_resumo(titulo, valor, subtitulo=None):
             "flex": "1"
         }
     )
-
-
-def formatar_numero(valor):
-    try:
-        return f"{int(valor):,}".replace(",", ".")
-    except Exception:
-        return "0"
 
 
 def aplicar_filtros(df, ufs, municipios, categorias, data_ini, data_fim, texto_busca):
@@ -396,12 +360,11 @@ def aplicar_filtros(df, ufs, municipios, categorias, data_ini, data_fim, texto_b
 
         if texto:
             mascara = (
-                df["titulo"].astype(str).str.lower().str.contains(texto, na=False)
-                | df["municipio"].astype(str).str.lower().str.contains(texto, na=False)
-                | df["categoria"].astype(str).str.lower().str.contains(texto, na=False)
-                | df["query_origem"].astype(str).str.lower().str.contains(texto, na=False)
+                df["titulo"].astype(str).str.lower().str.contains(texto, na=False, regex=False)
+                | df["municipio"].astype(str).str.lower().str.contains(texto, na=False, regex=False)
+                | df["categoria"].astype(str).str.lower().str.contains(texto, na=False, regex=False)
+                | df["query_origem"].astype(str).str.lower().str.contains(texto, na=False, regex=False)
             )
-
             df = df[mascara]
 
     return df
@@ -416,20 +379,10 @@ def layout_login():
         [
             html.Div(
                 [
-                    html.H1(
-                        "Painel Pop Rua",
-                        style={
-                            "margin": "0",
-                            "fontSize": "30px",
-                            "color": "#111827"
-                        }
-                    ),
+                    html.H1("Painel Pop Rua", style={"margin": "0", "fontSize": "30px", "color": "#111827"}),
                     html.P(
-                        "Acesse com seu usuário cadastrado no banco de dados.",
-                        style={
-                            "marginTop": "8px",
-                            "color": "#6b7280"
-                        }
+                        "Acesse com seu usuário.",
+                        style={"marginTop": "8px", "color": "#6b7280"}
                     ),
 
                     html.Label("E-mail", style={"fontWeight": "600", "color": "#374151"}),
@@ -486,30 +439,7 @@ def layout_login():
 
                     html.Div(
                         id="login_mensagem",
-                        style={
-                            "marginTop": "14px",
-                            "fontSize": "14px",
-                            "color": "#b91c1c"
-                        }
-                    ),
-
-                    html.Div(
-                        [
-                            html.P(
-                                "Primeiro acesso? Garanta que o admin inicial foi criado via variáveis ADMIN_EMAIL e ADMIN_PASSWORD.",
-                                style={
-                                    "fontSize": "12px",
-                                    "color": "#6b7280",
-                                    "lineHeight": "1.4"
-                                }
-                            )
-                        ],
-                        style={
-                            "marginTop": "18px",
-                            "backgroundColor": "#f9fafb",
-                            "padding": "12px",
-                            "borderRadius": "10px"
-                        }
+                        style={"marginTop": "14px", "fontSize": "14px", "color": "#b91c1c"}
                     )
                 ],
                 style={
@@ -537,29 +467,12 @@ def layout_dashboard(usuario):
     perfil = usuario.get("perfil", "usuario")
 
     tabs = [
-        dcc.Tab(
-            label="Dashboard",
-            value="tab_dashboard",
-            children=layout_tab_dashboard()
-        )
+        dcc.Tab(label="Dashboard", value="tab_dashboard", children=layout_tab_dashboard())
     ]
 
     if perfil == "admin":
-        tabs.append(
-            dcc.Tab(
-                label="Usuários",
-                value="tab_usuarios",
-                children=layout_tab_usuarios()
-            )
-        )
-
-        tabs.append(
-            dcc.Tab(
-                label="Logs de acesso",
-                value="tab_logs",
-                children=layout_tab_logs()
-            )
-        )
+        tabs.append(dcc.Tab(label="Usuários", value="tab_usuarios", children=layout_tab_usuarios()))
+        tabs.append(dcc.Tab(label="Logs de acesso", value="tab_logs", children=layout_tab_logs()))
 
     return html.Div(
         [
@@ -572,19 +485,11 @@ def layout_dashboard(usuario):
                         [
                             html.H1(
                                 "Painel População em Situação de Rua",
-                                style={
-                                    "margin": "0",
-                                    "fontSize": "30px",
-                                    "color": "#1f2937"
-                                }
+                                style={"margin": "0", "fontSize": "30px", "color": "#1f2937"}
                             ),
                             html.P(
                                 "Monitoramento de notícias e óbitos coletados automaticamente",
-                                style={
-                                    "margin": "8px 0 0 0",
-                                    "color": "#6b7280",
-                                    "fontSize": "15px"
-                                }
+                                style={"margin": "8px 0 0 0", "color": "#6b7280", "fontSize": "15px"}
                             )
                         ]
                     ),
@@ -595,15 +500,9 @@ def layout_dashboard(usuario):
                                 [
                                     html.Strong(nome_usuario),
                                     html.Br(),
-                                    html.Span(
-                                        f"Perfil: {perfil}",
-                                        style={"fontSize": "12px", "color": "#6b7280"}
-                                    )
+                                    html.Span(f"Perfil: {perfil}", style={"fontSize": "12px", "color": "#6b7280"})
                                 ],
-                                style={
-                                    "textAlign": "right",
-                                    "marginRight": "14px"
-                                }
+                                style={"textAlign": "right", "marginRight": "14px"}
                             ),
                             html.Button(
                                 "Sair",
@@ -620,10 +519,7 @@ def layout_dashboard(usuario):
                                 }
                             )
                         ],
-                        style={
-                            "display": "flex",
-                            "alignItems": "center"
-                        }
+                        style={"display": "flex", "alignItems": "center"}
                     )
                 ],
                 style={
@@ -638,9 +534,7 @@ def layout_dashboard(usuario):
                 id="tabs_principais",
                 value="tab_dashboard",
                 children=tabs,
-                style={
-                    "marginBottom": "20px"
-                }
+                style={"marginBottom": "20px"}
             )
         ],
         style={
@@ -675,45 +569,18 @@ def layout_tab_dashboard():
                 style={"marginBottom": "14px"}
             ),
 
-            html.Div(
-                id="status_dados",
-                style={
-                    "marginBottom": "18px",
-                    "color": "#6b7280",
-                    "fontSize": "13px"
-                }
-            ),
+            html.Div(id="status_dados", style={"marginBottom": "18px", "color": "#6b7280", "fontSize": "13px"}),
 
             html.Div(
                 id="cards_resumo",
-                style={
-                    "display": "flex",
-                    "gap": "16px",
-                    "flexWrap": "wrap",
-                    "marginBottom": "22px"
-                }
+                style={"display": "flex", "gap": "16px", "flexWrap": "wrap", "marginBottom": "22px"}
             ),
 
             html.Div(
                 [
-                    dcc.Dropdown(
-                        id="filtro_uf",
-                        multi=True,
-                        placeholder="Filtrar por UF",
-                        style={"width": "100%"}
-                    ),
-                    dcc.Dropdown(
-                        id="filtro_municipio",
-                        multi=True,
-                        placeholder="Filtrar por município",
-                        style={"width": "100%"}
-                    ),
-                    dcc.Dropdown(
-                        id="filtro_categoria",
-                        multi=True,
-                        placeholder="Filtrar por categoria",
-                        style={"width": "100%"}
-                    ),
+                    dcc.Dropdown(id="filtro_uf", multi=True, placeholder="Filtrar por UF", style={"width": "100%"}),
+                    dcc.Dropdown(id="filtro_municipio", multi=True, placeholder="Filtrar por município", style={"width": "100%"}),
+                    dcc.Dropdown(id="filtro_categoria", multi=True, placeholder="Filtrar por categoria", style={"width": "100%"}),
                     dcc.DatePickerRange(
                         id="filtro_data",
                         display_format="DD/MM/YYYY",
@@ -747,22 +614,10 @@ def layout_tab_dashboard():
                 [
                     html.Div(
                         [
-                            html.H3(
-                                "Mapa de ocorrências",
-                                style={
-                                    "marginTop": "0",
-                                    "marginBottom": "12px",
-                                    "color": "#374151"
-                                }
-                            ),
+                            html.H3("Mapa de ocorrências", style={"marginTop": "0", "marginBottom": "12px", "color": "#374151"}),
                             html.Iframe(
                                 id="mapa_html",
-                                style={
-                                    "width": "100%",
-                                    "height": "620px",
-                                    "border": "none",
-                                    "borderRadius": "12px"
-                                }
+                                style={"width": "100%", "height": "620px", "border": "none", "borderRadius": "12px"}
                             )
                         ],
                         style={
@@ -789,11 +644,7 @@ def layout_tab_dashboard():
                         }
                     )
                 ],
-                style={
-                    "display": "flex",
-                    "gap": "18px",
-                    "marginBottom": "22px"
-                }
+                style={"display": "flex", "gap": "18px", "marginBottom": "22px"}
             ),
 
             html.Div(
@@ -813,13 +664,7 @@ def layout_tab_dashboard():
                 [
                     html.Div(
                         [
-                            html.H3(
-                                "Registros",
-                                style={
-                                    "margin": "0",
-                                    "color": "#374151"
-                                }
-                            ),
+                            html.H3("Registros", style={"margin": "0", "color": "#374151"}),
                             html.Button(
                                 "⬇️ Exportar CSV filtrado",
                                 id="btn_exportar",
@@ -835,12 +680,7 @@ def layout_tab_dashboard():
                                 }
                             )
                         ],
-                        style={
-                            "display": "flex",
-                            "justifyContent": "space-between",
-                            "alignItems": "center",
-                            "marginBottom": "14px"
-                        }
+                        style={"display": "flex", "justifyContent": "space-between", "alignItems": "center", "marginBottom": "14px"}
                     ),
 
                     dash_table.DataTable(
@@ -857,9 +697,7 @@ def layout_tab_dashboard():
                         page_size=15,
                         sort_action="native",
                         filter_action="native",
-                        style_table={
-                            "overflowX": "auto"
-                        },
+                        style_table={"overflowX": "auto"},
                         style_cell={
                             "textAlign": "left",
                             "padding": "9px",
@@ -869,15 +707,8 @@ def layout_tab_dashboard():
                             "height": "auto",
                             "maxWidth": "360px"
                         },
-                        style_header={
-                            "fontWeight": "bold",
-                            "backgroundColor": "#f3f4f6",
-                            "color": "#111827"
-                        },
-                        style_data={
-                            "backgroundColor": "white",
-                            "color": "#374151"
-                        }
+                        style_header={"fontWeight": "bold", "backgroundColor": "#f3f4f6", "color": "#111827"},
+                        style_data={"backgroundColor": "white", "color": "#374151"}
                     )
                 ],
                 style={
@@ -915,12 +746,7 @@ def layout_tab_usuarios():
                         }
                     )
                 ],
-                style={
-                    "display": "flex",
-                    "justifyContent": "space-between",
-                    "alignItems": "center",
-                    "marginBottom": "16px"
-                }
+                style={"display": "flex", "justifyContent": "space-between", "alignItems": "center", "marginBottom": "16px"}
             ),
 
             html.Div(
@@ -954,18 +780,10 @@ def layout_tab_usuarios():
                         }
                     ),
                 ],
-                style={
-                    "display": "grid",
-                    "gridTemplateColumns": "1.2fr 1.4fr 1fr 1fr auto",
-                    "gap": "10px",
-                    "marginBottom": "10px"
-                }
+                style={"display": "grid", "gridTemplateColumns": "1.2fr 1.4fr 1fr 1fr auto", "gap": "10px", "marginBottom": "10px"}
             ),
 
-            html.Div(
-                id="usuarios_status",
-                style={"marginBottom": "14px", "fontSize": "14px"}
-            ),
+            html.Div(id="usuarios_status", style={"marginBottom": "14px", "fontSize": "14px"}),
 
             dash_table.DataTable(
                 id="tabela_usuarios",
@@ -983,16 +801,8 @@ def layout_tab_usuarios():
                 sort_action="native",
                 filter_action="native",
                 style_table={"overflowX": "auto"},
-                style_cell={
-                    "textAlign": "left",
-                    "padding": "8px",
-                    "fontFamily": "Arial",
-                    "fontSize": "13px"
-                },
-                style_header={
-                    "fontWeight": "bold",
-                    "backgroundColor": "#f3f4f6"
-                }
+                style_cell={"textAlign": "left", "padding": "8px", "fontFamily": "Arial", "fontSize": "13px"},
+                style_header={"fontWeight": "bold", "backgroundColor": "#f3f4f6"}
             )
         ],
         style={
@@ -1026,12 +836,7 @@ def layout_tab_logs():
                         }
                     )
                 ],
-                style={
-                    "display": "flex",
-                    "justifyContent": "space-between",
-                    "alignItems": "center",
-                    "marginBottom": "16px"
-                }
+                style={"display": "flex", "justifyContent": "space-between", "alignItems": "center", "marginBottom": "16px"}
             ),
 
             dash_table.DataTable(
@@ -1059,10 +864,7 @@ def layout_tab_logs():
                     "height": "auto",
                     "maxWidth": "380px"
                 },
-                style_header={
-                    "fontWeight": "bold",
-                    "backgroundColor": "#f3f4f6"
-                }
+                style_header={"fontWeight": "bold", "backgroundColor": "#f3f4f6"}
             )
         ],
         style={
@@ -1165,13 +967,13 @@ def fazer_logout(n_clicks, token):
         try:
             encerrar_sessao(token)
         except Exception as e:
-            print(f"Erro ao encerrar sessão: {e}")
+            log_erro("fazer_logout", e)
 
     return None, None
 
 
 # ============================================================
-# CALLBACK: CARREGAR DADOS DO BANCO
+# CALLBACK: CARREGAR DADOS
 # ============================================================
 
 @app.callback(
@@ -1186,50 +988,61 @@ def fazer_logout(n_clicks, token):
     State("sessao_token", "data")
 )
 def carregar_dados(n_clicks, token):
-    usuario = obter_usuario_por_token(token)
+    try:
+        usuario = obter_usuario_por_token(token)
 
-    if not usuario:
-        df_vazio = pd.DataFrame()
+        if not usuario:
+            df_vazio = tratar_dataframe(pd.DataFrame())
+            return (
+                df_vazio.to_json(date_format="iso", orient="split"),
+                "Sessão inválida ou expirada.",
+                [],
+                [],
+                []
+            )
+
+        df = carregar_dados_banco()
+
+        total = len(df)
+        agora = datetime.now().strftime("%d/%m/%Y %H:%M:%S")
+
+        status = (
+            f"Dados carregados do banco em {agora}. "
+            f"Total de registros: {formatar_numero(total)}."
+        )
+
+        opcoes_uf = [
+            {"label": uf, "value": uf}
+            for uf in sorted(df["uf"].dropna().unique())
+            if uf
+        ]
+
+        opcoes_municipio = [
+            {"label": municipio, "value": municipio}
+            for municipio in sorted(df["municipio"].dropna().unique())
+            if municipio
+        ]
+
+        opcoes_categoria = [
+            {"label": categoria, "value": categoria}
+            for categoria in sorted(df["categoria"].dropna().unique())
+            if categoria
+        ]
+
+        dados_json = df.to_json(date_format="iso", orient="split")
+
+        return dados_json, status, opcoes_uf, opcoes_municipio, opcoes_categoria
+
+    except Exception as e:
+        log_erro("carregar_dados", e)
+        df_vazio = tratar_dataframe(pd.DataFrame())
         return (
             df_vazio.to_json(date_format="iso", orient="split"),
-            "Sessão inválida ou expirada.",
+            mensagem_erro_usuario("carregar dados", e),
             [],
             [],
             []
         )
-
-    df = carregar_dados_banco()
-
-    total = len(df)
-
-    agora = datetime.now().strftime("%d/%m/%Y %H:%M:%S")
-
-    status = (
-        f"Dados carregados do banco em {agora}. "
-        f"Total de registros: {formatar_numero(total)}."
-    )
-
-    opcoes_uf = [
-        {"label": uf, "value": uf}
-        for uf in sorted(df["uf"].dropna().unique())
-        if uf
-    ]
-
-    opcoes_municipio = [
-        {"label": municipio, "value": municipio}
-        for municipio in sorted(df["municipio"].dropna().unique())
-        if municipio
-    ]
-
-    opcoes_categoria = [
-        {"label": categoria, "value": categoria}
-        for categoria in sorted(df["categoria"].dropna().unique())
-        if categoria
-    ]
-
-    dados_json = df.to_json(date_format="iso", orient="split")
-
-    return dados_json, status, opcoes_uf, opcoes_municipio, opcoes_categoria
 
 
 # ============================================================
@@ -1268,239 +1081,206 @@ def atualizar_dashboard(
     texto_busca,
     token
 ):
-    usuario = obter_usuario_por_token(token)
+    try:
+        usuario = obter_usuario_por_token(token)
 
-    if not usuario:
+        if not usuario:
+            df_vazio = pd.DataFrame(columns=["data", "municipio", "uf", "categoria", "titulo", "url", "query_origem"])
+            return (
+                "",
+                criar_figura_vazia("Registros por categoria"),
+                criar_figura_vazia("Registros por UF"),
+                criar_figura_vazia("Evolução no tempo"),
+                df_vazio.to_dict("records"),
+                [],
+                "Sessão inválida ou expirada.",
+                df_vazio.to_json(date_format="iso", orient="split")
+            )
+
+        if not dados_base:
+            df = carregar_dados_banco()
+        else:
+            df = ler_json_dataframe(dados_base)
+            df = tratar_dataframe(df)
+
+        df_filtrado = aplicar_filtros(
+            df=df,
+            ufs=ufs,
+            municipios=municipios,
+            categorias=categorias,
+            data_ini=data_ini,
+            data_fim=data_fim,
+            texto_busca=texto_busca
+        )
+
+        # MAPA
+        if df_filtrado.empty:
+            base_mapa = pd.DataFrame(
+                columns=["municipio", "uf", "categoria", "latitude", "longitude", "quantidade"]
+            )
+        else:
+            base_mapa = (
+                df_filtrado
+                .dropna(subset=["latitude", "longitude"])
+                .groupby(["municipio", "uf", "categoria", "latitude", "longitude"], as_index=False)["quantidade"]
+                .sum()
+            )
+
+        mapa_html = gerar_mapa(base_mapa)
+
+        # CATEGORIA
+        if df_filtrado.empty:
+            fig_categoria = criar_figura_vazia("Registros por categoria")
+        else:
+            df_categoria = (
+                df_filtrado
+                .groupby("categoria")
+                .size()
+                .reset_index(name="qtd")
+                .sort_values("qtd", ascending=True)
+            )
+
+            fig_categoria = px.bar(
+                df_categoria,
+                x="qtd",
+                y="categoria",
+                orientation="h",
+                title="Registros por categoria",
+                text="qtd"
+            )
+            fig_categoria.update_layout(
+                margin={"l": 20, "r": 20, "t": 50, "b": 20},
+                yaxis_title="",
+                xaxis_title="Quantidade"
+            )
+
+        # UF
+        if df_filtrado.empty:
+            fig_uf = criar_figura_vazia("Registros por UF")
+        else:
+            df_uf = (
+                df_filtrado
+                .groupby("uf")
+                .size()
+                .reset_index(name="qtd")
+                .sort_values("qtd", ascending=True)
+            )
+
+            fig_uf = px.bar(
+                df_uf,
+                x="qtd",
+                y="uf",
+                orientation="h",
+                title="Registros por UF",
+                text="qtd"
+            )
+            fig_uf.update_layout(
+                margin={"l": 20, "r": 20, "t": 50, "b": 20},
+                yaxis_title="",
+                xaxis_title="Quantidade"
+            )
+
+        # TEMPO
+        if df_filtrado.empty or df_filtrado["data"].dropna().empty:
+            fig_tempo = criar_figura_vazia("Evolução no tempo")
+        else:
+            df_tempo = df_filtrado.dropna(subset=["data"]).copy()
+            df_tempo["data_dia"] = pd.to_datetime(df_tempo["data"], errors="coerce").dt.date
+
+            df_tempo = (
+                df_tempo
+                .dropna(subset=["data_dia"])
+                .groupby("data_dia")
+                .size()
+                .reset_index(name="qtd")
+                .sort_values("data_dia")
+            )
+
+            fig_tempo = px.line(
+                df_tempo,
+                x="data_dia",
+                y="qtd",
+                title="Evolução no tempo",
+                markers=True
+            )
+            fig_tempo.update_layout(
+                margin={"l": 20, "r": 20, "t": 50, "b": 20},
+                xaxis_title="Data",
+                yaxis_title="Quantidade"
+            )
+
+        # TABELA
+        tabela_df = df_filtrado.copy()
+
+        if not tabela_df.empty:
+            tabela_df["data"] = pd.to_datetime(tabela_df["data"], errors="coerce").dt.strftime("%d/%m/%Y %H:%M")
+            tabela_df = tabela_df[["data", "municipio", "uf", "categoria", "titulo", "url", "query_origem"]]
+        else:
+            tabela_df = pd.DataFrame(columns=["data", "municipio", "uf", "categoria", "titulo", "url", "query_origem"])
+
+        # CARDS
+        total_registros = len(df_filtrado)
+        total_municipios = df_filtrado["municipio"].nunique() if not df_filtrado.empty else 0
+        total_ufs = df_filtrado["uf"].nunique() if not df_filtrado.empty else 0
+        total_categorias = df_filtrado["categoria"].nunique() if not df_filtrado.empty else 0
+
+        cards = [
+            card_resumo("Total de registros", formatar_numero(total_registros)),
+            card_resumo("Municípios", formatar_numero(total_municipios)),
+            card_resumo("UFs", formatar_numero(total_ufs)),
+            card_resumo("Categorias", formatar_numero(total_categorias)),
+        ]
+
+        # INSIGHT
+        if df_filtrado.empty:
+            insight = "Sem dados para os filtros selecionados."
+        else:
+            top_municipio = df_filtrado.groupby("municipio").size().idxmax()
+            qtd_top_municipio = df_filtrado.groupby("municipio").size().max()
+
+            top_categoria = df_filtrado.groupby("categoria").size().idxmax()
+            qtd_top_categoria = df_filtrado.groupby("categoria").size().max()
+
+            insight = (
+                f"Principal município no filtro atual: {top_municipio} "
+                f"({formatar_numero(qtd_top_municipio)} registros). "
+                f"Principal categoria: {top_categoria} "
+                f"({formatar_numero(qtd_top_categoria)} registros)."
+            )
+
+        dados_filtrados = df_filtrado.to_json(date_format="iso", orient="split")
+
+        return (
+            mapa_html,
+            fig_categoria,
+            fig_uf,
+            fig_tempo,
+            tabela_df.to_dict("records"),
+            cards,
+            insight,
+            dados_filtrados
+        )
+
+    except Exception as e:
+        log_erro("atualizar_dashboard", e)
+
         df_vazio = pd.DataFrame(columns=["data", "municipio", "uf", "categoria", "titulo", "url", "query_origem"])
+
         return (
             "",
             criar_figura_vazia("Registros por categoria"),
             criar_figura_vazia("Registros por UF"),
             criar_figura_vazia("Evolução no tempo"),
             df_vazio.to_dict("records"),
-            [],
-            "Sessão inválida ou expirada.",
+            [
+                card_resumo("Total de registros", "0"),
+                card_resumo("Municípios", "0"),
+                card_resumo("UFs", "0"),
+                card_resumo("Categorias", "0"),
+            ],
+            mensagem_erro_usuario("atualizar dashboard", e),
             df_vazio.to_json(date_format="iso", orient="split")
         )
-
-    if not dados_base:
-        df = carregar_dados_banco()
-    else:
-        df = pd.read_json(dados_base, orient="split")
-        df = tratar_dataframe(df)
-
-    df_filtrado = aplicar_filtros(
-        df=df,
-        ufs=ufs,
-        municipios=municipios,
-        categorias=categorias,
-        data_ini=data_ini,
-        data_fim=data_fim,
-        texto_busca=texto_busca
-    )
-
-    # =========================
-    # MAPA
-    # =========================
-    if df_filtrado.empty:
-        base_mapa = pd.DataFrame(
-            columns=[
-                "municipio",
-                "uf",
-                "categoria",
-                "latitude",
-                "longitude",
-                "quantidade"
-            ]
-        )
-    else:
-        base_mapa = (
-            df_filtrado
-            .dropna(subset=["latitude", "longitude"])
-            .groupby(
-                ["municipio", "uf", "categoria", "latitude", "longitude"],
-                as_index=False
-            )["quantidade"]
-            .sum()
-        )
-
-    mapa_html = gerar_mapa(base_mapa)
-
-    # =========================
-    # GRÁFICO CATEGORIA
-    # =========================
-    if df_filtrado.empty:
-        fig_categoria = criar_figura_vazia("Registros por categoria")
-    else:
-        df_categoria = (
-            df_filtrado
-            .groupby("categoria")
-            .size()
-            .reset_index(name="qtd")
-            .sort_values("qtd", ascending=True)
-        )
-
-        fig_categoria = px.bar(
-            df_categoria,
-            x="qtd",
-            y="categoria",
-            orientation="h",
-            title="Registros por categoria",
-            text="qtd"
-        )
-
-        fig_categoria.update_layout(
-            margin={"l": 20, "r": 20, "t": 50, "b": 20},
-            yaxis_title="",
-            xaxis_title="Quantidade"
-        )
-
-    # =========================
-    # GRÁFICO UF
-    # =========================
-    if df_filtrado.empty:
-        fig_uf = criar_figura_vazia("Registros por UF")
-    else:
-        df_uf = (
-            df_filtrado
-            .groupby("uf")
-            .size()
-            .reset_index(name="qtd")
-            .sort_values("qtd", ascending=True)
-        )
-
-        fig_uf = px.bar(
-            df_uf,
-            x="qtd",
-            y="uf",
-            orientation="h",
-            title="Registros por UF",
-            text="qtd"
-        )
-
-        fig_uf.update_layout(
-            margin={"l": 20, "r": 20, "t": 50, "b": 20},
-            yaxis_title="",
-            xaxis_title="Quantidade"
-        )
-
-    # =========================
-    # GRÁFICO TEMPO
-    # =========================
-    if df_filtrado.empty or df_filtrado["data"].dropna().empty:
-        fig_tempo = criar_figura_vazia("Evolução no tempo")
-    else:
-        df_tempo = (
-            df_filtrado
-            .dropna(subset=["data"])
-            .copy()
-        )
-
-        df_tempo["data_dia"] = pd.to_datetime(df_tempo["data"]).dt.date
-
-        df_tempo = (
-            df_tempo
-            .groupby("data_dia")
-            .size()
-            .reset_index(name="qtd")
-            .sort_values("data_dia")
-        )
-
-        fig_tempo = px.line(
-            df_tempo,
-            x="data_dia",
-            y="qtd",
-            title="Evolução no tempo",
-            markers=True
-        )
-
-        fig_tempo.update_layout(
-            margin={"l": 20, "r": 20, "t": 50, "b": 20},
-            xaxis_title="Data",
-            yaxis_title="Quantidade"
-        )
-
-    # =========================
-    # TABELA
-    # =========================
-    tabela_df = df_filtrado.copy()
-
-    if not tabela_df.empty:
-        tabela_df["data"] = pd.to_datetime(
-            tabela_df["data"],
-            errors="coerce"
-        ).dt.strftime("%d/%m/%Y %H:%M")
-
-        tabela_df = tabela_df[
-            [
-                "data",
-                "municipio",
-                "uf",
-                "categoria",
-                "titulo",
-                "url",
-                "query_origem"
-            ]
-        ]
-    else:
-        tabela_df = pd.DataFrame(
-            columns=[
-                "data",
-                "municipio",
-                "uf",
-                "categoria",
-                "titulo",
-                "url",
-                "query_origem"
-            ]
-        )
-
-    # =========================
-    # CARDS
-    # =========================
-    total_registros = len(df_filtrado)
-    total_municipios = df_filtrado["municipio"].nunique() if not df_filtrado.empty else 0
-    total_ufs = df_filtrado["uf"].nunique() if not df_filtrado.empty else 0
-    total_categorias = df_filtrado["categoria"].nunique() if not df_filtrado.empty else 0
-
-    cards = [
-        card_resumo("Total de registros", formatar_numero(total_registros)),
-        card_resumo("Municípios", formatar_numero(total_municipios)),
-        card_resumo("UFs", formatar_numero(total_ufs)),
-        card_resumo("Categorias", formatar_numero(total_categorias)),
-    ]
-
-    # =========================
-    # INSIGHT
-    # =========================
-    if df_filtrado.empty:
-        insight = "Sem dados para os filtros selecionados."
-    else:
-        top_municipio = df_filtrado.groupby("municipio").size().idxmax()
-        qtd_top_municipio = df_filtrado.groupby("municipio").size().max()
-
-        top_categoria = df_filtrado.groupby("categoria").size().idxmax()
-        qtd_top_categoria = df_filtrado.groupby("categoria").size().max()
-
-        insight = (
-            f"Principal município no filtro atual: {top_municipio} "
-            f"({formatar_numero(qtd_top_municipio)} registros). "
-            f"Principal categoria: {top_categoria} "
-            f"({formatar_numero(qtd_top_categoria)} registros)."
-        )
-
-    dados_filtrados = df_filtrado.to_json(date_format="iso", orient="split")
-
-    return (
-        mapa_html,
-        fig_categoria,
-        fig_uf,
-        fig_tempo,
-        tabela_df.to_dict("records"),
-        cards,
-        insight,
-        dados_filtrados
-    )
 
 
 # ============================================================
@@ -1515,52 +1295,54 @@ def atualizar_dashboard(
     prevent_initial_call=True
 )
 def exportar_csv(n_clicks, dados_filtrados, token):
-    usuario = obter_usuario_por_token(token)
+    try:
+        usuario = obter_usuario_por_token(token)
 
-    if not usuario:
+        if not usuario or not n_clicks:
+            return dash.no_update
+
+        if dados_filtrados:
+            df_export = ler_json_dataframe(dados_filtrados)
+            df_export = tratar_dataframe(df_export)
+        else:
+            df_export = carregar_dados_banco()
+
+        colunas_export = [
+            "id",
+            "titulo",
+            "url",
+            "municipio",
+            "uf",
+            "categoria",
+            "latitude",
+            "longitude",
+            "data_coleta",
+            "data_publicacao",
+            "query_origem",
+            "criado_em"
+        ]
+
+        for coluna in colunas_export:
+            if coluna not in df_export.columns:
+                df_export[coluna] = None
+
+        df_export = df_export[colunas_export]
+
+        return send_data_frame(
+            df_export.to_csv,
+            "pop_rua_filtrado.csv",
+            index=False,
+            sep=";",
+            encoding="utf-8-sig"
+        )
+
+    except Exception as e:
+        log_erro("exportar_csv", e)
         return dash.no_update
-
-    if not n_clicks:
-        return dash.no_update
-
-    if dados_filtrados:
-        df_export = pd.read_json(dados_filtrados, orient="split")
-        df_export = tratar_dataframe(df_export)
-    else:
-        df_export = carregar_dados_banco()
-
-    colunas_export = [
-        "id",
-        "titulo",
-        "url",
-        "municipio",
-        "uf",
-        "categoria",
-        "latitude",
-        "longitude",
-        "data_coleta",
-        "data_publicacao",
-        "query_origem",
-        "criado_em"
-    ]
-
-    for coluna in colunas_export:
-        if coluna not in df_export.columns:
-            df_export[coluna] = None
-
-    df_export = df_export[colunas_export]
-
-    return send_data_frame(
-        df_export.to_csv,
-        "pop_rua_filtrado.csv",
-        index=False,
-        sep=";",
-        encoding="utf-8-sig"
-    )
 
 
 # ============================================================
-# CALLBACKS - ADMIN / USUÁRIOS
+# CALLBACKS - ADMIN
 # ============================================================
 
 @app.callback(
@@ -1591,6 +1373,7 @@ def carregar_usuarios_admin(n_clicks, token):
         return df.to_dict("records"), f"Usuários carregados: {len(df)}"
 
     except Exception as e:
+        log_erro("carregar_usuarios_admin", e)
         return [], f"Erro ao carregar usuários: {e}"
 
 
@@ -1627,6 +1410,7 @@ def criar_usuario_admin(n_clicks, nome, email, senha, perfil, token):
         return f"✅ Usuário criado com sucesso. ID: {usuario_id}. Clique em Recarregar usuários."
 
     except Exception as e:
+        log_erro("criar_usuario_admin", e)
         return f"❌ Erro ao criar usuário: {e}"
 
 
@@ -1654,7 +1438,7 @@ def carregar_logs_admin(n_clicks, token):
         return df.to_dict("records")
 
     except Exception as e:
-        print(f"Erro ao carregar logs: {e}")
+        log_erro("carregar_logs_admin", e)
         return []
 
 
