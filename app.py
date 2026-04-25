@@ -1345,6 +1345,53 @@ def exportar_csv(n_clicks, dados_filtrados, token):
         return dash.no_update
 
 
+
+def formatar_usuarios_para_tabela():
+    """
+    Busca e formata usuários para exibir na DataTable.
+    Usado tanto no botão Recarregar usuários quanto após criar novo usuário.
+    """
+    usuarios = listar_usuarios()
+    df = pd.DataFrame(usuarios)
+
+    if df.empty:
+        return []
+
+    for col in ["criado_em", "atualizado_em", "ultimo_login"]:
+        if col in df.columns:
+            df[col] = pd.to_datetime(df[col], errors="coerce").dt.strftime("%d/%m/%Y %H:%M")
+
+    return df.to_dict("records")
+
+
+def validar_campos_novo_usuario(nome, email, senha, perfil):
+    """
+    Valida campos antes de chamar o banco.
+    Evita erro genérico e melhora retorno na tela.
+    """
+    nome = str(nome or "").strip()
+    email = str(email or "").strip().lower()
+    senha = str(senha or "")
+    perfil = str(perfil or "usuario").strip().lower()
+
+    if not nome:
+        return False, "Informe o nome do usuário.", nome, email, senha, perfil
+
+    if not email:
+        return False, "Informe o e-mail do usuário.", nome, email, senha, perfil
+
+    if "@" not in email or "." not in email:
+        return False, "Informe um e-mail válido.", nome, email, senha, perfil
+
+    if not senha or len(senha) < 6:
+        return False, "A senha inicial deve ter pelo menos 6 caracteres.", nome, email, senha, perfil
+
+    if perfil not in {"admin", "gestor", "usuario", "visualizador"}:
+        return False, "Perfil inválido.", nome, email, senha, perfil
+
+    return True, "", nome, email, senha, perfil
+
+
 # ============================================================
 # CALLBACKS - ADMIN
 # ============================================================
@@ -1367,17 +1414,12 @@ def carregar_usuarios_admin(n_clicks, token):
         return [], "Acesso negado."
 
     try:
-        usuarios = listar_usuarios()
-        df = pd.DataFrame(usuarios)
+        dados = formatar_usuarios_para_tabela()
 
-        if df.empty:
+        if not dados:
             return [], "Nenhum usuário encontrado."
 
-        for col in ["criado_em", "atualizado_em", "ultimo_login"]:
-            if col in df.columns:
-                df[col] = pd.to_datetime(df[col], errors="coerce").dt.strftime("%d/%m/%Y %H:%M")
-
-        return df.to_dict("records"), f"Usuários carregados: {len(df)}"
+        return dados, f"Usuários carregados: {len(dados)}"
 
     except PreventUpdate:
         raise
@@ -1387,7 +1429,13 @@ def carregar_usuarios_admin(n_clicks, token):
 
 
 @app.callback(
-    Output("usuarios_status", "children", allow_duplicate=True),
+    [
+        Output("usuarios_status", "children", allow_duplicate=True),
+        Output("tabela_usuarios", "data", allow_duplicate=True),
+        Output("novo_nome", "value"),
+        Output("novo_email", "value"),
+        Output("novo_senha", "value"),
+    ],
     Input("btn_criar_usuario", "n_clicks"),
     [
         State("novo_nome", "value"),
@@ -1399,33 +1447,84 @@ def carregar_usuarios_admin(n_clicks, token):
     prevent_initial_call=True
 )
 def criar_usuario_admin(n_clicks, nome, email, senha, perfil, token):
-    if not token:
+    """
+    Cria usuário pelo painel admin.
+
+    Ajustes importantes:
+    - não usa PreventUpdate quando o admin clicou no botão, para não parecer erro silencioso;
+    - valida os campos antes do banco;
+    - atualiza a tabela automaticamente após criar;
+    - limpa nome/e-mail/senha quando cria com sucesso.
+    """
+    if not n_clicks:
         raise PreventUpdate
+
+    if not token:
+        return (
+            "Sessão não encontrada. Faça login novamente.",
+            dash.no_update,
+            dash.no_update,
+            dash.no_update,
+            dash.no_update,
+        )
 
     usuario = obter_usuario_por_token(token)
 
     if not usuario_eh_admin(usuario):
-        return "Acesso negado."
+        return (
+            "Acesso negado. Apenas administradores podem criar usuários.",
+            dash.no_update,
+            dash.no_update,
+            dash.no_update,
+            dash.no_update,
+        )
 
-    if not n_clicks:
-        return dash.no_update
+    ok, msg, nome, email, senha, perfil = validar_campos_novo_usuario(
+        nome=nome,
+        email=email,
+        senha=senha,
+        perfil=perfil
+    )
+
+    if not ok:
+        return (
+            f"❌ {msg}",
+            dash.no_update,
+            dash.no_update,
+            dash.no_update,
+            dash.no_update,
+        )
 
     try:
         usuario_id = criar_usuario(
             nome=nome,
             email=email,
             senha=senha,
-            perfil=perfil or "usuario",
+            perfil=perfil,
             primeiro_acesso=True
         )
 
-        return f"✅ Usuário criado com sucesso. ID: {usuario_id}. Clique em Recarregar usuários."
+        dados_atualizados = formatar_usuarios_para_tabela()
+
+        return (
+            f"✅ Usuário criado com sucesso. ID: {usuario_id}.",
+            dados_atualizados,
+            "",
+            "",
+            "",
+        )
 
     except PreventUpdate:
         raise
     except Exception as e:
         log_erro("criar_usuario_admin", e)
-        return f"❌ Erro ao criar usuário: {e}"
+        return (
+            f"❌ Erro ao criar usuário: {e}",
+            dash.no_update,
+            dash.no_update,
+            dash.no_update,
+            dash.no_update,
+        )
 
 
 @app.callback(
