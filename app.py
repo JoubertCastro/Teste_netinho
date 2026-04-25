@@ -14,7 +14,7 @@ import plotly.express as px
 import folium
 from folium.plugins import MarkerCluster
 
-from flask import request
+from flask import request, session, redirect, url_for, render_template_string
 from sqlalchemy import create_engine, text
 
 from gerenciador_usuarios import (
@@ -26,6 +26,9 @@ from gerenciador_usuarios import (
     listar_usuarios,
     criar_usuario,
     listar_logs_acesso,
+    ativar_usuario,
+    desativar_usuario,
+    resetar_senha,
 )
 
 
@@ -102,7 +105,541 @@ app = dash.Dash(
 )
 
 server = app.server
-server.secret_key = os.getenv("SECRET_KEY", "4uU4kzaFfM6nmrMMvm2sQV2xhRJwRooH_qa972_0a5OtT6lu0BfXqDzv9QPlQffqp-omynE0zRzqR-fvZEV9Cg")
+server.secret_key = os.getenv("SECRET_KEY", "dev-secret-key-change-me")
+
+
+
+# ============================================================
+# GERENCIADOR DE USUÁRIOS VIA FLASK
+# ============================================================
+# Esta área evita depender de callbacks dinâmicos do Dash para criar usuários.
+# O Dashboard continua igual; apenas a gestão de usuários passa a usar rotas Flask
+# protegidas por sessão server-side.
+
+ADMIN_CSS = """
+<style>
+    body {
+        margin: 0;
+        font-family: Arial, sans-serif;
+        background: #f3f4f6;
+        color: #111827;
+    }
+    .wrap {
+        max-width: 1180px;
+        margin: 30px auto;
+        padding: 0 18px;
+    }
+    .card {
+        background: white;
+        border-radius: 16px;
+        box-shadow: 0 4px 14px rgba(0,0,0,0.08);
+        padding: 22px;
+        margin-bottom: 18px;
+    }
+    .topbar {
+        display: flex;
+        justify-content: space-between;
+        align-items: center;
+        gap: 16px;
+        margin-bottom: 18px;
+    }
+    h1, h2, h3 { margin: 0; }
+    .muted { color: #6b7280; font-size: 14px; margin-top: 6px; }
+    .grid {
+        display: grid;
+        grid-template-columns: 1.2fr 1.5fr 1fr 1fr auto;
+        gap: 10px;
+        align-items: end;
+    }
+    label {
+        display: block;
+        font-size: 13px;
+        font-weight: 700;
+        color: #374151;
+        margin-bottom: 6px;
+    }
+    input, select {
+        width: 100%;
+        height: 40px;
+        border: 1px solid #d1d5db;
+        border-radius: 10px;
+        padding: 0 10px;
+        box-sizing: border-box;
+    }
+    button, .btn {
+        border: none;
+        border-radius: 10px;
+        padding: 11px 15px;
+        cursor: pointer;
+        font-weight: 700;
+        text-decoration: none;
+        display: inline-block;
+        font-size: 14px;
+    }
+    .btn-primary { background: #2563eb; color: white; }
+    .btn-dark { background: #1f2937; color: white; }
+    .btn-danger { background: #b91c1c; color: white; }
+    .btn-light { background: #e5e7eb; color: #111827; }
+    .btn-warning { background: #f59e0b; color: #111827; }
+    .msg {
+        padding: 12px 14px;
+        border-radius: 12px;
+        margin-bottom: 16px;
+        font-weight: 600;
+    }
+    .msg.ok { background: #ecfdf5; color: #047857; border: 1px solid #a7f3d0; }
+    .msg.err { background: #fef2f2; color: #b91c1c; border: 1px solid #fecaca; }
+    table {
+        width: 100%;
+        border-collapse: collapse;
+        font-size: 13px;
+    }
+    th, td {
+        text-align: left;
+        padding: 10px;
+        border-bottom: 1px solid #e5e7eb;
+        vertical-align: middle;
+    }
+    th {
+        background: #f9fafb;
+        color: #374151;
+        font-weight: 800;
+    }
+    .pill {
+        padding: 4px 8px;
+        border-radius: 999px;
+        font-size: 12px;
+        font-weight: 700;
+        display: inline-block;
+    }
+    .pill.ok { background: #dcfce7; color: #166534; }
+    .pill.no { background: #fee2e2; color: #991b1b; }
+    .actions {
+        display: flex;
+        gap: 6px;
+        flex-wrap: wrap;
+    }
+    .actions form { margin: 0; display: inline-flex; gap: 6px; }
+    .login-card {
+        max-width: 390px;
+        margin: 90px auto;
+    }
+    @media (max-width: 900px) {
+        .grid { grid-template-columns: 1fr; }
+        .topbar { flex-direction: column; align-items: flex-start; }
+        table { font-size: 12px; }
+    }
+</style>
+"""
+
+
+def admin_usuario_atual():
+    token = session.get("admin_token")
+    if not token:
+        return None
+
+    usuario = obter_usuario_por_token(token)
+    if not usuario or usuario.get("perfil") != "admin":
+        return None
+
+    return usuario
+
+
+def admin_redirect_se_necessario():
+    if not admin_usuario_atual():
+        return redirect(url_for("admin_login"))
+    return None
+
+
+@server.route("/admin/login", methods=["GET", "POST"])
+def admin_login():
+    erro = ""
+
+    if request.method == "POST":
+        email = request.form.get("email")
+        senha = request.form.get("senha")
+
+        resultado = autenticar_usuario(
+            email=email,
+            senha=senha,
+            ip=obter_ip_requisicao(),
+            user_agent=obter_user_agent()
+        )
+
+        if resultado.get("ok") and resultado.get("usuario", {}).get("perfil") == "admin":
+            session["admin_token"] = resultado["token_sessao"]
+            return redirect(url_for("admin_usuarios"))
+
+        if resultado.get("ok") and resultado.get("token_sessao"):
+            encerrar_sessao(resultado["token_sessao"])
+
+        erro = "Acesso negado. Use um usuário com perfil admin."
+
+    return render_template_string(
+        """
+        <!doctype html>
+        <html lang="pt-br">
+        <head>
+            <meta charset="utf-8">
+            <title>Login Admin - Painel Pop Rua</title>
+            {{ css|safe }}
+        </head>
+        <body>
+            <div class="wrap">
+                <div class="card login-card">
+                    <h1>Painel Pop Rua</h1>
+                    <p class="muted">Área administrativa de usuários</p>
+
+                    {% if erro %}
+                        <div class="msg err">{{ erro }}</div>
+                    {% endif %}
+
+                    <form method="post">
+                        <label>E-mail</label>
+                        <input name="email" type="email" required autocomplete="username">
+
+                        <br><br>
+
+                        <label>Senha</label>
+                        <input name="senha" type="password" required autocomplete="current-password">
+
+                        <br><br>
+
+                        <button class="btn btn-dark" type="submit" style="width:100%;">Entrar</button>
+                    </form>
+
+                    <p class="muted" style="margin-top:18px;">
+                        Voltar para o dashboard:
+                        <a href="/" style="color:#2563eb;font-weight:700;">abrir painel</a>
+                    </p>
+                </div>
+            </div>
+        </body>
+        </html>
+        """,
+        css=ADMIN_CSS,
+        erro=erro
+    )
+
+
+@server.route("/admin/logout", methods=["POST", "GET"])
+def admin_logout():
+    token = session.get("admin_token")
+    if token:
+        encerrar_sessao(token)
+    session.pop("admin_token", None)
+    return redirect(url_for("admin_login"))
+
+
+@server.route("/admin/usuarios", methods=["GET", "POST"])
+def admin_usuarios():
+    redir = admin_redirect_se_necessario()
+    if redir:
+        return redir
+
+    usuario_admin = admin_usuario_atual()
+    msg = ""
+    msg_tipo = "ok"
+
+    if request.method == "POST":
+        nome = str(request.form.get("nome") or "").strip()
+        email = str(request.form.get("email") or "").strip().lower()
+        senha = str(request.form.get("senha") or "")
+        perfil = str(request.form.get("perfil") or "usuario").strip().lower()
+
+        try:
+            novo_id = criar_usuario(
+                nome=nome,
+                email=email,
+                senha=senha,
+                perfil=perfil,
+                primeiro_acesso=True
+            )
+            msg = f"Usuário criado com sucesso. ID: {novo_id}."
+            msg_tipo = "ok"
+        except Exception as e:
+            msg = f"Erro ao criar usuário: {e}"
+            msg_tipo = "err"
+
+    usuarios = listar_usuarios()
+    logs = listar_logs_acesso(limit=20)
+
+    return render_template_string(
+        """
+        <!doctype html>
+        <html lang="pt-br">
+        <head>
+            <meta charset="utf-8">
+            <title>Usuários - Painel Pop Rua</title>
+            {{ css|safe }}
+        </head>
+        <body>
+            <div class="wrap">
+                <div class="topbar">
+                    <div>
+                        <h1>Gerenciamento de usuários</h1>
+                        <p class="muted">
+                            Logado como <strong>{{ admin.nome }}</strong> — {{ admin.email }}
+                        </p>
+                    </div>
+
+                    <div>
+                        <a class="btn btn-light" href="/">Dashboard</a>
+                        <a class="btn btn-light" href="{{ url_for('admin_logs') }}">Logs</a>
+                        <a class="btn btn-danger" href="{{ url_for('admin_logout') }}">Sair</a>
+                    </div>
+                </div>
+
+                {% if msg %}
+                    <div class="msg {{ msg_tipo }}">{{ msg }}</div>
+                {% endif %}
+
+                <div class="card">
+                    <h2>Criar novo usuário</h2>
+                    <p class="muted">A senha será salva com hash. O usuário ficará marcado como primeiro acesso.</p>
+
+                    <form method="post" class="grid">
+                        <div>
+                            <label>Nome</label>
+                            <input name="nome" type="text" required>
+                        </div>
+
+                        <div>
+                            <label>E-mail</label>
+                            <input name="email" type="email" required>
+                        </div>
+
+                        <div>
+                            <label>Senha inicial</label>
+                            <input name="senha" type="password" required minlength="6">
+                        </div>
+
+                        <div>
+                            <label>Perfil</label>
+                            <select name="perfil">
+                                <option value="usuario">Usuário</option>
+                                <option value="visualizador">Visualizador</option>
+                                <option value="gestor">Gestor</option>
+                                <option value="admin">Admin</option>
+                            </select>
+                        </div>
+
+                        <div>
+                            <button class="btn btn-primary" type="submit">Criar usuário</button>
+                        </div>
+                    </form>
+                </div>
+
+                <div class="card">
+                    <h2>Usuários cadastrados</h2>
+                    <p class="muted">Total: {{ usuarios|length }}</p>
+
+                    <table>
+                        <thead>
+                            <tr>
+                                <th>ID</th>
+                                <th>Nome</th>
+                                <th>E-mail</th>
+                                <th>Perfil</th>
+                                <th>Ativo</th>
+                                <th>Primeiro acesso</th>
+                                <th>Senha expirada</th>
+                                <th>Último login</th>
+                                <th>Ações</th>
+                            </tr>
+                        </thead>
+                        <tbody>
+                            {% for u in usuarios %}
+                                <tr>
+                                    <td>{{ u.id }}</td>
+                                    <td>{{ u.nome }}</td>
+                                    <td>{{ u.email }}</td>
+                                    <td>{{ u.perfil }}</td>
+                                    <td>
+                                        {% if u.ativo %}
+                                            <span class="pill ok">ativo</span>
+                                        {% else %}
+                                            <span class="pill no">inativo</span>
+                                        {% endif %}
+                                    </td>
+                                    <td>{{ u.primeiro_acesso }}</td>
+                                    <td>{{ u.senha_expirada }}</td>
+                                    <td>{{ u.ultimo_login or "" }}</td>
+                                    <td>
+                                        <div class="actions">
+                                            {% if u.ativo %}
+                                                <form method="post" action="{{ url_for('admin_desativar_usuario', usuario_id=u.id) }}">
+                                                    <button class="btn btn-warning" type="submit">Desativar</button>
+                                                </form>
+                                            {% else %}
+                                                <form method="post" action="{{ url_for('admin_ativar_usuario', usuario_id=u.id) }}">
+                                                    <button class="btn btn-primary" type="submit">Ativar</button>
+                                                </form>
+                                            {% endif %}
+
+                                            <form method="post" action="{{ url_for('admin_resetar_senha_usuario', usuario_id=u.id) }}">
+                                                <input name="senha_temporaria" type="password" placeholder="Nova senha" minlength="6" required style="width:120px;height:36px;">
+                                                <button class="btn btn-light" type="submit">Reset</button>
+                                            </form>
+                                        </div>
+                                    </td>
+                                </tr>
+                            {% endfor %}
+                        </tbody>
+                    </table>
+                </div>
+
+                <div class="card">
+                    <h2>Últimos logs de acesso</h2>
+                    <table>
+                        <thead>
+                            <tr>
+                                <th>Data</th>
+                                <th>E-mail</th>
+                                <th>Sucesso</th>
+                                <th>Motivo</th>
+                                <th>IP</th>
+                            </tr>
+                        </thead>
+                        <tbody>
+                            {% for l in logs %}
+                                <tr>
+                                    <td>{{ l.criado_em }}</td>
+                                    <td>{{ l.email }}</td>
+                                    <td>{{ l.sucesso }}</td>
+                                    <td>{{ l.motivo }}</td>
+                                    <td>{{ l.ip or "" }}</td>
+                                </tr>
+                            {% endfor %}
+                        </tbody>
+                    </table>
+                </div>
+            </div>
+        </body>
+        </html>
+        """,
+        css=ADMIN_CSS,
+        admin=usuario_admin,
+        usuarios=usuarios,
+        logs=logs,
+        msg=msg,
+        msg_tipo=msg_tipo
+    )
+
+
+@server.route("/admin/logs", methods=["GET"])
+def admin_logs():
+    redir = admin_redirect_se_necessario()
+    if redir:
+        return redir
+
+    logs = listar_logs_acesso(limit=300)
+
+    return render_template_string(
+        """
+        <!doctype html>
+        <html lang="pt-br">
+        <head>
+            <meta charset="utf-8">
+            <title>Logs - Painel Pop Rua</title>
+            {{ css|safe }}
+        </head>
+        <body>
+            <div class="wrap">
+                <div class="topbar">
+                    <div>
+                        <h1>Logs de acesso</h1>
+                        <p class="muted">Últimos 300 registros.</p>
+                    </div>
+
+                    <div>
+                        <a class="btn btn-light" href="{{ url_for('admin_usuarios') }}">Usuários</a>
+                        <a class="btn btn-light" href="/">Dashboard</a>
+                        <a class="btn btn-danger" href="{{ url_for('admin_logout') }}">Sair</a>
+                    </div>
+                </div>
+
+                <div class="card">
+                    <table>
+                        <thead>
+                            <tr>
+                                <th>ID</th>
+                                <th>Usuário ID</th>
+                                <th>E-mail</th>
+                                <th>Sucesso</th>
+                                <th>Motivo</th>
+                                <th>IP</th>
+                                <th>User Agent</th>
+                                <th>Criado em</th>
+                            </tr>
+                        </thead>
+                        <tbody>
+                            {% for l in logs %}
+                                <tr>
+                                    <td>{{ l.id }}</td>
+                                    <td>{{ l.usuario_id or "" }}</td>
+                                    <td>{{ l.email }}</td>
+                                    <td>{{ l.sucesso }}</td>
+                                    <td>{{ l.motivo }}</td>
+                                    <td>{{ l.ip or "" }}</td>
+                                    <td>{{ l.user_agent or "" }}</td>
+                                    <td>{{ l.criado_em }}</td>
+                                </tr>
+                            {% endfor %}
+                        </tbody>
+                    </table>
+                </div>
+            </div>
+        </body>
+        </html>
+        """,
+        css=ADMIN_CSS,
+        logs=logs
+    )
+
+
+@server.route("/admin/usuarios/<int:usuario_id>/desativar", methods=["POST"])
+def admin_desativar_usuario(usuario_id):
+    redir = admin_redirect_se_necessario()
+    if redir:
+        return redir
+
+    try:
+        desativar_usuario(usuario_id)
+    except Exception as e:
+        print(f"Erro ao desativar usuário {usuario_id}: {e}", flush=True)
+
+    return redirect(url_for("admin_usuarios"))
+
+
+@server.route("/admin/usuarios/<int:usuario_id>/ativar", methods=["POST"])
+def admin_ativar_usuario(usuario_id):
+    redir = admin_redirect_se_necessario()
+    if redir:
+        return redir
+
+    try:
+        ativar_usuario(usuario_id)
+    except Exception as e:
+        print(f"Erro ao ativar usuário {usuario_id}: {e}", flush=True)
+
+    return redirect(url_for("admin_usuarios"))
+
+
+@server.route("/admin/usuarios/<int:usuario_id>/resetar-senha", methods=["POST"])
+def admin_resetar_senha_usuario(usuario_id):
+    redir = admin_redirect_se_necessario()
+    if redir:
+        return redir
+
+    senha_temporaria = request.form.get("senha_temporaria")
+
+    try:
+        resetar_senha(usuario_id, senha_temporaria)
+    except Exception as e:
+        print(f"Erro ao resetar senha do usuário {usuario_id}: {e}", flush=True)
+
+    return redirect(url_for("admin_usuarios"))
 
 
 # ============================================================
@@ -758,78 +1295,25 @@ def layout_tab_usuarios():
             html.Div(
                 [
                     html.H3("Gerenciamento de usuários", style={"marginTop": 0}),
-                    html.Button(
-                        "🔄 Recarregar usuários",
-                        id="btn_recarregar_usuarios",
-                        n_clicks=0,
-                        style={
-                            "backgroundColor": "#1f2937",
-                            "color": "white",
-                            "border": "none",
-                            "borderRadius": "10px",
-                            "padding": "10px 16px",
-                            "cursor": "pointer",
-                            "fontWeight": "600"
-                        }
-                    )
-                ],
-                style={"display": "flex", "justifyContent": "space-between", "alignItems": "center", "marginBottom": "16px"}
-            ),
-
-            html.Div(
-                [
-                    dcc.Input(id="novo_nome", type="text", placeholder="Nome", style={"height": "38px", "padding": "0 10px"}),
-                    dcc.Input(id="novo_email", type="email", placeholder="E-mail", style={"height": "38px", "padding": "0 10px"}),
-                    dcc.Input(id="novo_senha", type="password", placeholder="Senha inicial", style={"height": "38px", "padding": "0 10px"}),
-                    dcc.Dropdown(
-                        id="novo_perfil",
-                        options=[
-                            {"label": "Admin", "value": "admin"},
-                            {"label": "Gestor", "value": "gestor"},
-                            {"label": "Usuário", "value": "usuario"},
-                            {"label": "Visualizador", "value": "visualizador"},
-                        ],
-                        value="usuario",
-                        clearable=False
+                    html.P(
+                        "A gestão de usuários foi movida para uma área administrativa server-side para evitar problemas de sessão em callbacks dinâmicos do Dash.",
+                        style={"color": "#6b7280", "fontSize": "14px", "lineHeight": "1.5"}
                     ),
-                    html.Button(
-                        "Criar usuário",
-                        id="btn_criar_usuario",
-                        n_clicks=0,
+                    html.A(
+                        "Abrir gerenciador de usuários",
+                        href="/admin/usuarios",
+                        target="_blank",
                         style={
                             "backgroundColor": "#2563eb",
                             "color": "white",
-                            "border": "none",
                             "borderRadius": "10px",
-                            "padding": "10px 16px",
-                            "cursor": "pointer",
-                            "fontWeight": "600"
+                            "padding": "12px 18px",
+                            "display": "inline-block",
+                            "textDecoration": "none",
+                            "fontWeight": "700"
                         }
-                    ),
-                ],
-                style={"display": "grid", "gridTemplateColumns": "1.2fr 1.4fr 1fr 1fr auto", "gap": "10px", "marginBottom": "10px"}
-            ),
-
-            html.Div(id="usuarios_status", style={"marginBottom": "14px", "fontSize": "14px"}),
-
-            dash_table.DataTable(
-                id="tabela_usuarios",
-                columns=[
-                    {"name": "ID", "id": "id"},
-                    {"name": "Nome", "id": "nome"},
-                    {"name": "E-mail", "id": "email"},
-                    {"name": "Perfil", "id": "perfil"},
-                    {"name": "Ativo", "id": "ativo"},
-                    {"name": "Primeiro acesso", "id": "primeiro_acesso"},
-                    {"name": "Senha expirada", "id": "senha_expirada"},
-                    {"name": "Último login", "id": "ultimo_login"},
-                ],
-                page_size=12,
-                sort_action="native",
-                filter_action="native",
-                style_table={"overflowX": "auto"},
-                style_cell={"textAlign": "left", "padding": "8px", "fontFamily": "Arial", "fontSize": "13px"},
-                style_header={"fontWeight": "bold", "backgroundColor": "#f3f4f6"}
+                    )
+                ]
             )
         ],
         style={
@@ -848,50 +1332,25 @@ def layout_tab_logs():
             html.Div(
                 [
                     html.H3("Logs de acesso", style={"marginTop": 0}),
-                    html.Button(
-                        "🔄 Recarregar logs",
-                        id="btn_recarregar_logs",
-                        n_clicks=0,
+                    html.P(
+                        "Os logs de acesso agora ficam na área administrativa server-side.",
+                        style={"color": "#6b7280", "fontSize": "14px", "lineHeight": "1.5"}
+                    ),
+                    html.A(
+                        "Abrir logs de acesso",
+                        href="/admin/logs",
+                        target="_blank",
                         style={
                             "backgroundColor": "#1f2937",
                             "color": "white",
-                            "border": "none",
                             "borderRadius": "10px",
-                            "padding": "10px 16px",
-                            "cursor": "pointer",
-                            "fontWeight": "600"
+                            "padding": "12px 18px",
+                            "display": "inline-block",
+                            "textDecoration": "none",
+                            "fontWeight": "700"
                         }
                     )
-                ],
-                style={"display": "flex", "justifyContent": "space-between", "alignItems": "center", "marginBottom": "16px"}
-            ),
-
-            dash_table.DataTable(
-                id="tabela_logs",
-                columns=[
-                    {"name": "ID", "id": "id"},
-                    {"name": "Usuário ID", "id": "usuario_id"},
-                    {"name": "E-mail", "id": "email"},
-                    {"name": "Sucesso", "id": "sucesso"},
-                    {"name": "Motivo", "id": "motivo"},
-                    {"name": "IP", "id": "ip"},
-                    {"name": "User Agent", "id": "user_agent"},
-                    {"name": "Criado em", "id": "criado_em"},
-                ],
-                page_size=15,
-                sort_action="native",
-                filter_action="native",
-                style_table={"overflowX": "auto"},
-                style_cell={
-                    "textAlign": "left",
-                    "padding": "8px",
-                    "fontFamily": "Arial",
-                    "fontSize": "13px",
-                    "whiteSpace": "normal",
-                    "height": "auto",
-                    "maxWidth": "380px"
-                },
-                style_header={"fontWeight": "bold", "backgroundColor": "#f3f4f6"}
+                ]
             )
         ],
         style={
