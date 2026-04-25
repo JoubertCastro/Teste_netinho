@@ -5,6 +5,7 @@ from io import StringIO
 
 import dash
 from dash import dcc, html, Input, Output, State, dash_table
+from dash.exceptions import PreventUpdate
 from dash.dcc import send_data_frame
 
 import pandas as pd
@@ -101,7 +102,7 @@ app = dash.Dash(
 )
 
 server = app.server
-server.secret_key = os.getenv("SECRET_KEY", "dev-secret-key-change-me")
+server.secret_key = os.getenv("SECRET_KEY", "4uU4kzaFfM6nmrMMvm2sQV2xhRJwRooH_qa972_0a5OtT6lu0BfXqDzv9QPlQffqp-omynE0zRzqR-fvZEV9Cg")
 
 
 # ============================================================
@@ -880,7 +881,7 @@ def layout_tab_logs():
 app.layout = html.Div(
     [
         dcc.Location(id="url"),
-        dcc.Store(id="sessao_token", storage_type="session"),
+        dcc.Store(id="sessao_token", storage_type="local"),
         dcc.Store(id="usuario_logado", storage_type="session"),
         html.Div(id="pagina_container")
     ]
@@ -989,17 +990,16 @@ def fazer_logout(n_clicks, token):
 )
 def carregar_dados(n_clicks, token):
     try:
+        # Evita disparos automáticos enquanto o token ainda não foi carregado pelo navegador.
+        if not token:
+            raise PreventUpdate
+
         usuario = obter_usuario_por_token(token)
 
+        # Se por algum motivo o token ainda não validou, não sobrescrevemos a tela com
+        # "sessão inválida" ao alternar entre abas. O próximo render/login trata isso.
         if not usuario:
-            df_vazio = tratar_dataframe(pd.DataFrame())
-            return (
-                df_vazio.to_json(date_format="iso", orient="split"),
-                "Sessão inválida ou expirada.",
-                [],
-                [],
-                []
-            )
+            raise PreventUpdate
 
         df = carregar_dados_banco()
 
@@ -1082,20 +1082,15 @@ def atualizar_dashboard(
     token
 ):
     try:
+        # Ao alternar entre abas, alguns callbacks podem disparar antes do token estar disponível.
+        # Nesses casos, não atualizamos nada para evitar a mensagem indevida de sessão inválida.
+        if not token:
+            raise PreventUpdate
+
         usuario = obter_usuario_por_token(token)
 
         if not usuario:
-            df_vazio = pd.DataFrame(columns=["data", "municipio", "uf", "categoria", "titulo", "url", "query_origem"])
-            return (
-                "",
-                criar_figura_vazia("Registros por categoria"),
-                criar_figura_vazia("Registros por UF"),
-                criar_figura_vazia("Evolução no tempo"),
-                df_vazio.to_dict("records"),
-                [],
-                "Sessão inválida ou expirada.",
-                df_vazio.to_json(date_format="iso", orient="split")
-            )
+            raise PreventUpdate
 
         if not dados_base:
             df = carregar_dados_banco()
@@ -1296,10 +1291,13 @@ def atualizar_dashboard(
 )
 def exportar_csv(n_clicks, dados_filtrados, token):
     try:
+        if not token:
+            raise PreventUpdate
+
         usuario = obter_usuario_por_token(token)
 
         if not usuario or not n_clicks:
-            return dash.no_update
+            raise PreventUpdate
 
         if dados_filtrados:
             df_export = ler_json_dataframe(dados_filtrados)
@@ -1354,6 +1352,9 @@ def exportar_csv(n_clicks, dados_filtrados, token):
     State("sessao_token", "data")
 )
 def carregar_usuarios_admin(n_clicks, token):
+    if not token:
+        raise PreventUpdate
+
     usuario = obter_usuario_por_token(token)
 
     if not usuario_eh_admin(usuario):
@@ -1390,6 +1391,9 @@ def carregar_usuarios_admin(n_clicks, token):
     prevent_initial_call=True
 )
 def criar_usuario_admin(n_clicks, nome, email, senha, perfil, token):
+    if not token:
+        raise PreventUpdate
+
     usuario = obter_usuario_por_token(token)
 
     if not usuario_eh_admin(usuario):
@@ -1420,6 +1424,9 @@ def criar_usuario_admin(n_clicks, nome, email, senha, perfil, token):
     State("sessao_token", "data")
 )
 def carregar_logs_admin(n_clicks, token):
+    if not token:
+        raise PreventUpdate
+
     usuario = obter_usuario_por_token(token)
 
     if not usuario_eh_admin(usuario):
