@@ -1033,6 +1033,8 @@ def carregar_dados(n_clicks, token):
 
         return dados_json, status, opcoes_uf, opcoes_municipio, opcoes_categoria
 
+    except PreventUpdate:
+        raise
     except Exception as e:
         log_erro("carregar_dados", e)
         df_vazio = tratar_dataframe(pd.DataFrame())
@@ -1256,6 +1258,8 @@ def atualizar_dashboard(
             dados_filtrados
         )
 
+    except PreventUpdate:
+        raise
     except Exception as e:
         log_erro("atualizar_dashboard", e)
 
@@ -1334,6 +1338,8 @@ def exportar_csv(n_clicks, dados_filtrados, token):
             encoding="utf-8-sig"
         )
 
+    except PreventUpdate:
+        raise
     except Exception as e:
         log_erro("exportar_csv", e)
         return dash.no_update
@@ -1373,6 +1379,8 @@ def carregar_usuarios_admin(n_clicks, token):
 
         return df.to_dict("records"), f"Usuários carregados: {len(df)}"
 
+    except PreventUpdate:
+        raise
     except Exception as e:
         log_erro("carregar_usuarios_admin", e)
         return [], f"Erro ao carregar usuários: {e}"
@@ -1413,6 +1421,8 @@ def criar_usuario_admin(n_clicks, nome, email, senha, perfil, token):
 
         return f"✅ Usuário criado com sucesso. ID: {usuario_id}. Clique em Recarregar usuários."
 
+    except PreventUpdate:
+        raise
     except Exception as e:
         log_erro("criar_usuario_admin", e)
         return f"❌ Erro ao criar usuário: {e}"
@@ -1444,6 +1454,8 @@ def carregar_logs_admin(n_clicks, token):
 
         return df.to_dict("records")
 
+    except PreventUpdate:
+        raise
     except Exception as e:
         log_erro("carregar_logs_admin", e)
         return []
