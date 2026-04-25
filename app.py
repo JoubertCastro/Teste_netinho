@@ -1025,13 +1025,54 @@ def layout_dashboard(usuario):
     nome_usuario = usuario.get("nome", "Usuário")
     perfil = usuario.get("perfil", "usuario")
 
-    tabs = [
-        dcc.Tab(label="Dashboard", value="tab_dashboard", children=layout_tab_dashboard())
+    botoes_usuario = [
+        html.Div(
+            [
+                html.Strong(nome_usuario),
+                html.Br(),
+                html.Span(f"Perfil: {perfil}", style={"fontSize": "12px", "color": "#6b7280"})
+            ],
+            style={"textAlign": "right", "marginRight": "14px"}
+        )
     ]
 
     if perfil == "admin":
-        tabs.append(dcc.Tab(label="Usuários", value="tab_usuarios", children=layout_tab_usuarios()))
-        tabs.append(dcc.Tab(label="Logs de acesso", value="tab_logs", children=layout_tab_logs()))
+        botoes_usuario.append(
+            html.A(
+                "Gerenciar usuários",
+                href="/admin/usuarios",
+                target="_blank",
+                style={
+                    "backgroundColor": "#2563eb",
+                    "color": "white",
+                    "border": "none",
+                    "borderRadius": "10px",
+                    "padding": "11px 16px",
+                    "cursor": "pointer",
+                    "fontWeight": "600",
+                    "textDecoration": "none",
+                    "display": "inline-block",
+                    "marginRight": "8px"
+                }
+            )
+        )
+
+    botoes_usuario.append(
+        html.Button(
+            "Sair",
+            id="btn_logout",
+            n_clicks=0,
+            style={
+                "backgroundColor": "#b91c1c",
+                "color": "white",
+                "border": "none",
+                "borderRadius": "10px",
+                "padding": "11px 16px",
+                "cursor": "pointer",
+                "fontWeight": "600"
+            }
+        )
+    )
 
     return html.Div(
         [
@@ -1059,30 +1100,7 @@ def layout_dashboard(usuario):
                     ),
 
                     html.Div(
-                        [
-                            html.Div(
-                                [
-                                    html.Strong(nome_usuario),
-                                    html.Br(),
-                                    html.Span(f"Perfil: {perfil}", style={"fontSize": "12px", "color": "#6b7280"})
-                                ],
-                                style={"textAlign": "right", "marginRight": "14px"}
-                            ),
-                            html.Button(
-                                "Sair",
-                                id="btn_logout",
-                                n_clicks=0,
-                                style={
-                                    "backgroundColor": "#b91c1c",
-                                    "color": "white",
-                                    "border": "none",
-                                    "borderRadius": "10px",
-                                    "padding": "11px 16px",
-                                    "cursor": "pointer",
-                                    "fontWeight": "600"
-                                }
-                            )
-                        ],
+                        botoes_usuario,
                         style={"display": "flex", "alignItems": "center"}
                     )
                 ],
@@ -1094,12 +1112,7 @@ def layout_dashboard(usuario):
                 }
             ),
 
-            dcc.Tabs(
-                id="tabs_principais",
-                value="tab_dashboard",
-                children=tabs,
-                style={"marginBottom": "20px"}
-            )
+            layout_tab_dashboard()
         ],
         style={
             "padding": "26px",
@@ -1108,6 +1121,7 @@ def layout_dashboard(usuario):
             "fontFamily": "Arial, sans-serif"
         }
     )
+
 
 
 def layout_tab_dashboard():
@@ -1128,11 +1142,31 @@ def layout_tab_dashboard():
                             "cursor": "pointer",
                             "fontWeight": "600"
                         }
+                    ),
+                    html.Button(
+                        "📰 Coletar novos dados",
+                        id="btn_coletar_dados",
+                        n_clicks=0,
+                        style={
+                            "backgroundColor": "#047857",
+                            "color": "white",
+                            "border": "none",
+                            "borderRadius": "10px",
+                            "padding": "12px 18px",
+                            "cursor": "pointer",
+                            "fontWeight": "600"
+                        }
                     )
                 ],
-                style={"marginBottom": "14px"}
+                style={
+                    "marginBottom": "14px",
+                    "display": "flex",
+                    "gap": "10px",
+                    "flexWrap": "wrap"
+                }
             ),
 
+            html.Div(id="status_coleta", style={"marginBottom": "8px", "color": "#047857", "fontSize": "13px", "fontWeight": "600"}),
             html.Div(id="status_dados", style={"marginBottom": "18px", "color": "#6b7280", "fontSize": "13px"}),
 
             html.Div(
@@ -1471,16 +1505,20 @@ def fazer_logout(n_clicks, token):
         Output("status_dados", "children"),
         Output("filtro_uf", "options"),
         Output("filtro_municipio", "options"),
-        Output("filtro_categoria", "options")
+        Output("filtro_categoria", "options"),
+        Output("status_coleta", "children")
     ],
-    Input("btn_recarregar", "n_clicks"),
+    [
+        Input("btn_recarregar", "n_clicks"),
+        Input("btn_coletar_dados", "n_clicks")
+    ],
     [
         State("sessao_token", "data"),
         State("token_contexto", "data"),
         State("usuario_logado", "data")
     ]
 )
-def carregar_dados(n_clicks, token, token_contexto, usuario_store):
+def carregar_dados(n_recarregar, n_coletar, token, token_contexto, usuario_store):
     try:
         token = resolver_token(token, token_contexto, usuario_store)
 
@@ -1490,10 +1528,32 @@ def carregar_dados(n_clicks, token, token_contexto, usuario_store):
 
         usuario = obter_usuario_por_token(token)
 
-        # Se por algum motivo o token ainda não validou, não sobrescrevemos a tela com
-        # "sessão inválida" ao alternar entre abas. O próximo render/login trata isso.
+        # Se por algum motivo o token ainda não validou, não sobrescrevemos a tela.
         if not usuario:
             raise PreventUpdate
+
+        trigger = ""
+        try:
+            trigger = dash.callback_context.triggered[0]["prop_id"].split(".")[0]
+        except Exception:
+            trigger = ""
+
+        status_coleta = ""
+
+        if trigger == "btn_coletar_dados":
+            if not usuario_eh_admin(usuario):
+                status_coleta = "Apenas usuários admin podem executar a coleta."
+            else:
+                inicio_coleta = datetime.now()
+                try:
+                    import coletor
+                    coletor.main()
+                    fim_coleta = datetime.now()
+                    duracao = int((fim_coleta - inicio_coleta).total_seconds())
+                    status_coleta = f"Coleta finalizada com sucesso em {duracao}s. Dados recarregados automaticamente."
+                except Exception as e:
+                    log_erro("coletar_novos_dados", e)
+                    status_coleta = f"Erro ao executar coleta: {type(e).__name__}: {e}"
 
         df = carregar_dados_banco()
 
@@ -1525,7 +1585,7 @@ def carregar_dados(n_clicks, token, token_contexto, usuario_store):
 
         dados_json = df.to_json(date_format="iso", orient="split")
 
-        return dados_json, status, opcoes_uf, opcoes_municipio, opcoes_categoria
+        return dados_json, status, opcoes_uf, opcoes_municipio, opcoes_categoria, status_coleta
 
     except PreventUpdate:
         raise
@@ -1537,7 +1597,8 @@ def carregar_dados(n_clicks, token, token_contexto, usuario_store):
             mensagem_erro_usuario("carregar dados", e),
             [],
             [],
-            []
+            [],
+            ""
         )
 
 
