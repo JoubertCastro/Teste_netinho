@@ -1112,7 +1112,7 @@ def layout_dashboard(usuario):
                 }
             ),
 
-            layout_tab_dashboard()
+            layout_tab_dashboard(perfil)
         ],
         style={
             "padding": "26px",
@@ -1124,7 +1124,7 @@ def layout_dashboard(usuario):
 
 
 
-def layout_tab_dashboard():
+def layout_tab_dashboard(perfil="usuario"):
     return html.Div(
         [
             html.Div(
@@ -1156,6 +1156,11 @@ def layout_tab_dashboard():
                             "cursor": "pointer",
                             "fontWeight": "600"
                         }
+                    ) if perfil == "admin" else html.Button(
+                        "",
+                        id="btn_coletar_dados",
+                        n_clicks=0,
+                        style={"display": "none"}
                     )
                 ],
                 style={
