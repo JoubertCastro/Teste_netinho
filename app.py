@@ -64,7 +64,7 @@ def criar_tabela_pop_rua():
         categoria TEXT,
         latitude DOUBLE PRECISION,
         longitude DOUBLE PRECISION,
-        data_coleta TIMESTAMP,
+        data_coleta TIMESTAMP ,
         data_publicacao TIMESTAMP NULL,
         query_origem TEXT,
         criado_em TIMESTAMP DEFAULT NOW()
@@ -396,7 +396,7 @@ def admin_usuarios():
 
                 <div class="card">
                     <h2>Criar novo usuário</h2>
-                    <p class="muted">A senha será salva com hash. O usuário ficará marcado como primeiro acesso.</p>
+                    <p class="muted">Atenção na criação do usuário.</p>
 
                     <form method="post" class="grid">
                         <div>
@@ -1093,7 +1093,7 @@ def layout_dashboard(usuario):
                                 style={"margin": "0", "fontSize": "30px", "color": "#1f2937"}
                             ),
                             html.P(
-                                "Monitoramento de notícias e óbitos coletados automaticamente",
+                                "Monitoramento de notícias e óbitos",
                                 style={"margin": "8px 0 0 0", "color": "#6b7280", "fontSize": "15px"}
                             )
                         ]
